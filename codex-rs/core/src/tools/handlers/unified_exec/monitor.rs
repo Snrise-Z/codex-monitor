@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
+use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::registry::CoreToolRuntime;
@@ -17,6 +19,7 @@ use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_utils_path_uri::PathConvention;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -253,6 +256,38 @@ async fn start(
 
     let cwd = turn_environment.cwd().clone();
 
+    // Run the watcher with the same sandbox access the session has granted,
+    // exactly like the normal exec tool (see exec_command.rs). Without this the
+    // watcher would always fall back to the turn's restrictive default sandbox
+    // even when the session has been granted escalated (e.g. full-access)
+    // permissions, so a monitor command would be sandboxed differently from
+    // every other command the agent runs in the same session.
+    //
+    // Match granted permissions against the cwd the watcher will actually run in
+    // (`cwd`), falling back to the session cwd for non-native/foreign paths,
+    // mirroring exec_command's `permission_cwd`. Matching against a different cwd
+    // than the command runs in would let a cwd-scoped grant be evaluated for one
+    // directory and applied to a command in another.
+    // Only use the watcher cwd for permission matching when it is a native-
+    // convention absolute path; otherwise fall back to the session cwd, exactly
+    // as exec_command does (a foreign drive-style path can otherwise look like a
+    // host absolute path on POSIX).
+    let native_cwd = cwd
+        .to_abs_path()
+        .ok()
+        .filter(|_| cwd.infer_path_convention() == Some(PathConvention::native()));
+    let permission_cwd = match native_cwd.as_ref() {
+        Some(native) => native.as_path(),
+        None => turn.config.cwd.as_path(),
+    };
+    let effective_permissions = apply_granted_turn_permissions(
+        session.as_ref(),
+        &turn_environment.environment_id,
+        permission_cwd,
+        SandboxPermissions::UseDefault,
+        /*additional_permissions*/ None,
+    )
+    .await;
     let environment = Arc::clone(&turn_environment.environment);
     let shell_mode =
         shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
@@ -299,9 +334,9 @@ async fn start(
         shell_mode,
         network: turn.network.clone(),
         tty: false,
-        sandbox_permissions: Default::default(),
-        additional_permissions: None,
-        additional_permissions_preapproved: false,
+        sandbox_permissions: effective_permissions.sandbox_permissions,
+        additional_permissions: effective_permissions.additional_permissions.clone(),
+        additional_permissions_preapproved: effective_permissions.permissions_preapproved,
         justification: None,
         prefix_rule: None,
     };

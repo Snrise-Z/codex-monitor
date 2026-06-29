@@ -41,6 +41,8 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
+use std::time::Instant;
 use test_case::test_case;
 
 fn absolute_path(path: &Path) -> AbsolutePathBuf {
@@ -1166,6 +1168,152 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
     assert_eq!(fs::read_to_string(&outside_write)?, "sticky-grant-ok");
 
     Ok(())
+}
+
+/// A monitor watcher inherits the session's granted (turn-scoped) permissions,
+/// exactly like a normal exec command: a grant established earlier in the turn
+/// lets the watcher write a path the base sandbox forbids. With the monitor's
+/// previous hard-coded default sandbox this write was denied and the file never
+/// appeared, so this is a regression test for that fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_permissions_grant_applies_to_monitor() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+    let approval_policy = AskForApproval::OnRequest;
+    let permission_profile = workspace_write_excluding_tmp();
+    let permission_profile_for_config = workspace_write_excluding_tmp();
+
+    let mut builder = test_codex().with_config(move |config| {
+        config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config
+            .permissions
+            .set_permission_profile(permission_profile_for_config)
+            .expect("set permission profile");
+        config
+            .features
+            .enable(Feature::Monitor)
+            .expect("enable monitor feature");
+        config
+            .features
+            .enable(Feature::ExecPermissionApprovals)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::RequestPermissionsTool)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build(&server).await?;
+
+    // A directory outside the workspace that the base policy cannot write.
+    let outside_dir = tempfile::tempdir()?;
+    let outside_write = outside_dir.path().join("monitor-grant.txt");
+    // The watcher writes the marker to the granted path, then stays alive so it
+    // does not exit (and wake an extra turn) during the assertion window.
+    let command = format!(
+        "printf {:?} > {:?}; sleep 30",
+        "monitor-grant-ok", outside_write
+    );
+    let monitor_args = json!({
+        "action": "start",
+        "command": command,
+        "description": "permission inheritance probe",
+    })
+    .to_string();
+
+    let requested_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![absolute_path(outside_dir.path())]),
+        )),
+        ..Default::default()
+    };
+    let normalized_requested_permissions = RequestPermissionProfile {
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            Some(vec![]),
+            Some(vec![AbsolutePathBuf::try_from(
+                outside_dir.path().canonicalize()?,
+            )?]),
+        )),
+        ..Default::default()
+    };
+
+    let _responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-perm-1"),
+                request_permissions_tool_event(
+                    "permissions-call",
+                    "Allow the watcher to write outside the workspace",
+                    &requested_permissions,
+                )?,
+                ev_completed("resp-perm-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-perm-2"),
+                ev_function_call("monitor-call", "monitor", &monitor_args),
+                ev_completed("resp-perm-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-perm-3"),
+                ev_assistant_message("msg-perm-1", "done"),
+                ev_completed("resp-perm-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    submit_turn(
+        &test,
+        "watch a command that writes to the granted path",
+        approval_policy,
+        permission_profile,
+    )
+    .await?;
+
+    let granted_permissions = expect_request_permissions_event(&test, "permissions-call").await;
+    assert_eq!(granted_permissions, normalized_requested_permissions.clone());
+    test.codex
+        .submit(Op::RequestPermissionsResponse {
+            id: "permissions-call".to_string(),
+            response: RequestPermissionsResponse {
+                permissions: normalized_requested_permissions.clone(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            },
+        })
+        .await?;
+
+    // The watcher inherits the grant and should not need a further approval; drain
+    // to completion, approving defensively if an approval is surfaced.
+    if let Some(approval) = wait_for_exec_approval_or_completion(&test).await {
+        test.codex
+            .submit(Op::ExecApproval {
+                id: approval.effective_approval_id(),
+                turn_id: None,
+                decision: ReviewDecision::Approved,
+            })
+            .await?;
+        wait_for_completion(&test).await;
+    }
+
+    // The write lands only if the watcher inherited the granted permissions. With
+    // the old hard-coded default sandbox the outside dir is not writable, so the
+    // file never appears and this times out.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(contents) = fs::read_to_string(&outside_write) {
+            assert_eq!(contents, "monitor-grant-ok");
+            return Ok(());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watcher never wrote the granted path; the monitor did not inherit the turn grant"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

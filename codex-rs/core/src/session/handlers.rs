@@ -588,6 +588,13 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
+    // Abort monitor delivery tasks BEFORE aborting session tasks. A delivery
+    // task can wake an idle session (try_start_turn_if_idle), so if we aborted
+    // session tasks first a monitor could start a new turn in the window before
+    // its own task is aborted, and that turn would escape this shutdown. Doing
+    // monitors first means any turn a monitor still manages to start is then
+    // covered by abort_all_tasks below.
+    sess.services.monitor_manager.abort_all().await;
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     let _ = sess.conversation.shutdown().await;
     sess.services

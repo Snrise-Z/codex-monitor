@@ -327,6 +327,7 @@ use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttfm_metric;
+use crate::unified_exec::MonitorManager;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_core_plugins::PluginsManager;

@@ -395,6 +395,15 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    /// Returns the live process for `process_id`, if it is still tracked.
+    pub(super) async fn process_by_id(&self, process_id: i32) -> Option<Arc<UnifiedExecProcess>> {
+        let store = self.process_store.lock().await;
+        store
+            .processes
+            .get(&process_id)
+            .map(|entry| Arc::clone(&entry.process))
+    }
+
     pub(crate) async fn release_process_id(&self, process_id: i32) {
         let removed = {
             let mut store = self.process_store.lock().await;

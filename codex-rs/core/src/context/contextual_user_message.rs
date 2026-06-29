@@ -9,6 +9,7 @@ use super::InternalModelContextFragment;
 use super::LegacyApplyPatchExecCommandWarning;
 use super::LegacyModelMismatchWarning;
 use super::LegacyUnifiedExecProcessLimitWarning;
+use super::MonitorNotification;
 use super::RecommendedPluginsInstructions;
 use super::SkillInstructions;
 use super::SubagentNotification;
@@ -30,6 +31,8 @@ static USER_SHELL_COMMAND_REGISTRATION: FragmentRegistrationProxy<UserShellComma
 static TURN_ABORTED_REGISTRATION: FragmentRegistrationProxy<TurnAborted> =
     FragmentRegistrationProxy::new();
 static SUBAGENT_NOTIFICATION_REGISTRATION: FragmentRegistrationProxy<SubagentNotification> =
+    FragmentRegistrationProxy::new();
+static MONITOR_NOTIFICATION_REGISTRATION: FragmentRegistrationProxy<MonitorNotification> =
     FragmentRegistrationProxy::new();
 static INTERNAL_MODEL_CONTEXT_REGISTRATION: FragmentRegistrationProxy<
     InternalModelContextFragment,
@@ -54,6 +57,7 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &USER_SHELL_COMMAND_REGISTRATION,
     &TURN_ABORTED_REGISTRATION,
     &SUBAGENT_NOTIFICATION_REGISTRATION,
+    &MONITOR_NOTIFICATION_REGISTRATION,
     &INTERNAL_MODEL_CONTEXT_REGISTRATION,
     &RECOMMENDED_PLUGINS_REGISTRATION,
     &LEGACY_UNIFIED_EXEC_PROCESS_LIMIT_WARNING_REGISTRATION,

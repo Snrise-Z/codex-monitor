@@ -281,7 +281,6 @@ async fn unified_exec_begin_restores_working_status_snapshot() {
     let height = chat.desired_height(width);
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
         .expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw chatwidget");
@@ -365,6 +364,8 @@ async fn exec_end_without_begin_uses_event_command() {
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),
             process_id: None,
+            plugin_id: None,
+            script_path: None,
             source: ExecCommandSource::Agent,
             status: AppServerCommandExecutionStatus::Completed,
             command_actions,
@@ -878,6 +879,30 @@ async fn view_image_tool_call_preserves_foreign_path() {
 }
 
 #[tokio::test]
+async fn image_generation_begin_restores_working_status_after_single_line_preamble() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.on_task_started();
+    chat.on_agent_message_delta("Generating an image.".to_string());
+    chat.on_image_generation_begin();
+
+    assert!(chat.bottom_pane.is_task_running());
+    assert!(chat.bottom_pane.status_indicator_visible());
+
+    let width: u16 = 80;
+    let height = chat.desired_height(width);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("create terminal");
+    terminal
+        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+        .expect("draw image generation status");
+    assert_chatwidget_snapshot!(
+        "image_generation_begin_restores_working_status",
+        normalized_backend_snapshot(terminal.backend())
+    );
+}
+
+#[tokio::test]
 async fn image_generation_call_adds_history_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -1194,7 +1219,6 @@ async fn approval_modal_exec_without_reason_snapshot() -> anyhow::Result<()> {
     let height = chat.desired_height(width);
     let mut terminal =
         ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw approval modal (no reason)");
@@ -1239,7 +1263,6 @@ async fn approval_modal_exec_multiline_prefix_hides_execpolicy_option_snapshot()
     let height = chat.desired_height(width);
     let mut terminal =
         ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw approval modal (multiline prefix)");
@@ -1283,7 +1306,6 @@ async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
     let height = chat.desired_height(/*width*/ 80);
     let mut terminal =
         ratatui::Terminal::new(VT100Backend::new(/*width*/ 80, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, 80, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw patch approval modal");

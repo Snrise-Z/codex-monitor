@@ -1,4 +1,4 @@
-use codex_client::CodexHttpClient;
+use codex_http_client::HttpClient;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::PlanType as InternalPlanType;
 use serde::Deserialize;
@@ -39,7 +39,7 @@ impl fmt::Debug for PersonalAccessTokenAuth {
 impl PersonalAccessTokenAuth {
     pub(super) async fn load(
         access_token: &str,
-        auth_route_config: Option<&AuthRouteConfig>,
+        auth_route_config: &AuthRouteConfig,
     ) -> std::io::Result<Self> {
         let authapi_base_url = env::var(CODEX_AUTHAPI_BASE_URL_ENV_VAR)
             .ok()
@@ -77,7 +77,7 @@ impl PersonalAccessTokenAuth {
 }
 
 async fn hydrate_personal_access_token(
-    client: &CodexHttpClient,
+    client: &HttpClient,
     endpoint: &str,
     access_token: &str,
 ) -> std::io::Result<PersonalAccessTokenAuth> {

@@ -15,7 +15,7 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
-use ratatui::widgets::WidgetRef;
+use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app_event_sender::AppEventSender;
@@ -101,8 +101,7 @@ impl StatusIndicatorWidget {
     }
 
     pub(crate) fn interrupt(&self) {
-        self.app_event_tx
-            .interrupt_and_restore_prompt_if_no_output();
+        self.app_event_tx.interrupt();
     }
 
     /// Update the animated header label (left of the brackets).
@@ -140,7 +139,6 @@ impl StatusIndicatorWidget {
             .filter(|message| !message.is_empty());
     }
 
-    #[cfg(test)]
     pub(crate) fn header(&self) -> &str {
         &self.header
     }
@@ -295,7 +293,7 @@ impl Renderable for StatusIndicatorWidget {
             lines.extend(details.into_iter().take(max_details));
         }
 
-        Paragraph::new(Text::from(lines)).render_ref(area, buf);
+        Paragraph::new(Text::from(lines)).render(area, buf);
     }
 }
 

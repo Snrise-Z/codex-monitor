@@ -258,7 +258,7 @@ fn selection_item(name: &str, is_disabled: bool) -> SelectionItem {
 fn draw_view(tui: &mut Tui, view: &ListSelectionView) -> Result<()> {
     tui.draw(u16::MAX, |frame| {
         let area = frame.area();
-        frame.render_widget_ref(Clear, area);
+        frame.render_widget_ref(&Clear, area);
         let view_area = Rect::new(
             area.x,
             area.y,
@@ -311,6 +311,7 @@ mod tests {
             command: Some("/tmp/hook.sh".to_string()),
             timeout_sec: 30,
             status_message: None,
+            additional_context_limit: None,
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source: HookSource::User,
             plugin_id: None,

@@ -1,6 +1,7 @@
 pub use codex_backend_openapi_models::models::ConfigBundleResponse;
 pub use codex_backend_openapi_models::models::CreditStatusDetails;
 pub use codex_backend_openapi_models::models::DeliveredConfigToml;
+pub use codex_backend_openapi_models::models::DeliveredManagedLayers;
 pub use codex_backend_openapi_models::models::DeliveredRequirementsToml;
 pub use codex_backend_openapi_models::models::DeliveredTomlFragment;
 pub use codex_backend_openapi_models::models::PaginatedListTaskListItem;
@@ -23,6 +24,23 @@ pub struct RateLimitResetCreditsSummary {
     pub available_count: i64,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RateLimitResetCreditsDetails {
+    pub credits: Vec<RateLimitResetCreditDetails>,
+    pub available_count: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct RateLimitResetCreditDetails {
+    pub id: String,
+    pub reset_type: String,
+    pub status: String,
+    pub granted_at: String,
+    pub expires_at: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RateLimitsWithResetCredits {
     pub rate_limits: Vec<RateLimitSnapshot>,
@@ -40,6 +58,16 @@ pub(crate) struct RateLimitStatusWithResetCredits {
 pub struct CodexWorkspaceMessagesResponse {
     #[serde(default)]
     pub messages: Vec<CodexWorkspaceMessage>,
+}
+
+/// Authenticated Codex user settings used by CLI runtime policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct CodexUserSettingsResponse {
+    /// Server-computed effective commit-attribution policy.
+    ///
+    /// Older backend responses omit this field, which safely defaults to disabled.
+    #[serde(default)]
+    pub commit_attribution_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

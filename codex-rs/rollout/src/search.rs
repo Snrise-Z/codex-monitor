@@ -3,13 +3,14 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+use codex_protocol::protocol::strip_user_message_prefix;
 use regex::Regex;
 use regex::RegexBuilder;
 use tokio::process::Command;
@@ -80,6 +81,7 @@ async fn ripgrep_rollout_paths(
         .arg("--")
         .arg(search_term)
         .arg(root)
+        .stdin(Stdio::null())
         .output()
         .await
     {
@@ -293,14 +295,7 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
 fn content_item_text(item: &ContentItem) -> Option<&str> {
     match item {
         ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text.as_str()),
-        ContentItem::InputImage { .. } => None,
-    }
-}
-
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
+        ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => None,
     }
 }
 

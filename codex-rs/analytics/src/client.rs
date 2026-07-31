@@ -18,6 +18,7 @@ use crate::facts::HookRunInput;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequested;
 use crate::facts::PluginInstallRequestedInput;
+use crate::facts::PluginInstallSource;
 use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::SkillInvocation;
@@ -28,6 +29,7 @@ use crate::facts::TurnCodexErrorFact;
 use crate::facts::TurnProfileFact;
 use crate::facts::TurnResolvedConfigFact;
 use crate::facts::TurnTokenUsageFact;
+use crate::now_unix_millis;
 use crate::reducer::AnalyticsReducer;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
@@ -49,14 +51,22 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 const ANALYTICS_EVENTS_QUEUE_SIZE: usize = 256;
 const ANALYTICS_EVENTS_TIMEOUT: Duration = Duration::from_secs(10);
+// Covers two sequential POSTs plus queue/barrier scheduling; additional queued sends remain best-effort.
+const ANALYTICS_EVENTS_FLUSH_TIMEOUT: Duration = Duration::from_secs(25);
 const ANALYTICS_EVENT_DEDUPE_MAX_KEYS: usize = 4096;
+
+pub(crate) enum AnalyticsEventsQueueMessage {
+    Fact(Box<AnalyticsFact>),
+    Flush(oneshot::Sender<()>),
+}
 
 #[derive(Clone)]
 pub(crate) struct AnalyticsEventsQueue {
-    pub(crate) sender: mpsc::Sender<AnalyticsFact>,
+    pub(crate) sender: mpsc::Sender<AnalyticsEventsQueueMessage>,
     pub(crate) app_used_emitted_keys: Arc<Mutex<HashSet<(String, String)>>>,
     pub(crate) plugin_used_emitted_keys: Arc<Mutex<HashSet<(String, String)>>>,
 }
@@ -127,6 +137,13 @@ impl AnalyticsEventsQueue {
         tokio::spawn(async move {
             let mut reducer = AnalyticsReducer::default();
             while let Some(input) = receiver.recv().await {
+                let input = match input {
+                    AnalyticsEventsQueueMessage::Fact(input) => *input,
+                    AnalyticsEventsQueueMessage::Flush(done_tx) => {
+                        let _ = done_tx.send(());
+                        continue;
+                    }
+                };
                 let mut events = Vec::new();
                 reducer.ingest(input, &mut events).await;
                 send_track_events(&auth_manager, &destination, events).await;
@@ -140,7 +157,11 @@ impl AnalyticsEventsQueue {
     }
 
     fn try_send(&self, input: AnalyticsFact) {
-        if self.sender.try_send(input).is_err() {
+        if self
+            .sender
+            .try_send(AnalyticsEventsQueueMessage::Fact(Box::new(input)))
+            .is_err()
+        {
             //TODO: add a metric for this
             tracing::warn!("dropping analytics events: queue is full");
         }
@@ -203,6 +224,29 @@ impl AnalyticsEventsClient {
 
     pub fn disabled() -> Self {
         Self { queue: None }
+    }
+
+    pub async fn flush(&self) {
+        let Some(queue) = self.queue.as_ref() else {
+            return;
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        let flushed = tokio::time::timeout(ANALYTICS_EVENTS_FLUSH_TIMEOUT, async {
+            if queue
+                .sender
+                .send(AnalyticsEventsQueueMessage::Flush(done_tx))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            done_rx.await.is_ok()
+        })
+        .await;
+
+        if !matches!(flushed, Ok(true)) {
+            tracing::warn!("timed out or failed while flushing analytics events");
+        }
     }
 
     pub fn track_skill_invocations(
@@ -269,6 +313,18 @@ impl AnalyticsEventsClient {
         request_id: RequestId,
         request: &ClientRequest,
     ) {
+        if let ClientRequest::TurnInterrupt { params, .. } = request {
+            if params.turn_id.is_empty() {
+                return;
+            }
+            self.record_fact(AnalyticsFact::ExplicitClientInterruptRequest {
+                connection_id,
+                request_id,
+                turn_id: params.turn_id.clone(),
+                requested_at_ms: now_unix_millis(),
+            });
+            return;
+        }
         if !matches!(
             request,
             ClientRequest::TurnStart { .. } | ClientRequest::TurnSteer { .. }
@@ -370,11 +426,19 @@ impl AnalyticsEventsClient {
         ));
     }
 
-    pub fn track_plugin_install_failed(&self, plugin: PluginTelemetryMetadata, error_type: String) {
+    pub fn track_plugin_install_failed(
+        &self,
+        plugin: PluginTelemetryMetadata,
+        source: PluginInstallSource,
+        error_type: String,
+        sub_error_type: Option<String>,
+    ) {
         self.record_fact(AnalyticsFact::Custom(
             CustomAnalyticsFact::PluginInstallFailed(PluginInstallFailedInput {
                 plugin,
+                source,
                 error_type,
+                sub_error_type,
             }),
         ));
     }
@@ -434,7 +498,7 @@ impl AnalyticsEventsClient {
         &self,
         connection_id: u64,
         request_id: RequestId,
-        response: ClientResponsePayload,
+        response: &ClientResponsePayload,
     ) {
         self.track_response_inner(
             connection_id,
@@ -448,7 +512,7 @@ impl AnalyticsEventsClient {
         &self,
         connection_id: u64,
         request_id: RequestId,
-        response: ClientResponsePayload,
+        response: &ClientResponsePayload,
         thread_originator: String,
     ) {
         self.track_response_inner(connection_id, request_id, response, Some(thread_originator));
@@ -458,7 +522,7 @@ impl AnalyticsEventsClient {
         &self,
         connection_id: u64,
         request_id: RequestId,
-        response: ClientResponsePayload,
+        response: &ClientResponsePayload,
         thread_originator: Option<String>,
     ) {
         if !matches!(
@@ -468,13 +532,17 @@ impl AnalyticsEventsClient {
                 | ClientResponsePayload::ThreadFork(_)
                 | ClientResponsePayload::TurnStart(_)
                 | ClientResponsePayload::TurnSteer(_)
+                | ClientResponsePayload::TurnInterrupt(_)
         ) {
+            return;
+        }
+        if serde_json::to_writer(std::io::sink(), response).is_err() {
             return;
         }
         self.record_fact(AnalyticsFact::ClientResponse {
             connection_id,
             request_id,
-            response: Box::new(response),
+            response: Box::new(response.clone()),
             thread_originator,
         });
     }
@@ -528,7 +596,8 @@ impl AnalyticsEventsClient {
         });
     }
 
-    pub fn track_notification(&self, notification: ServerNotification) {
+    /// Records analytics-relevant notifications without cloning ignored variants.
+    pub fn track_notification(&self, notification: &ServerNotification) {
         if !matches!(
             notification,
             ServerNotification::TurnStarted(_)
@@ -541,14 +610,14 @@ impl AnalyticsEventsClient {
         ) {
             return;
         }
-        self.record_fact(AnalyticsFact::Notification(Box::new(notification)));
+        self.record_fact(AnalyticsFact::Notification(Box::new(notification.clone())));
     }
 }
 
 async fn send_track_events(
     auth_manager: &AuthManager,
     destination: &AnalyticsEventsDestination,
-    events: Vec<TrackEventRequest>,
+    mut events: Vec<TrackEventRequest>,
 ) {
     if events.is_empty() {
         return;
@@ -557,7 +626,12 @@ async fn send_track_events(
     let Some(auth) = auth_manager.auth().await else {
         return;
     };
-    if !auth.uses_codex_backend() {
+    if auth.is_api_key_auth() {
+        events.retain(TrackEventRequest::can_send_with_api_key_auth);
+    } else if !auth.uses_codex_backend() {
+        return;
+    }
+    if events.is_empty() {
         return;
     }
 

@@ -1,14 +1,17 @@
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use codex_core_skills::HostSkillsSnapshot;
+use codex_core_skills::loader::MAX_CONCURRENT_ROOT_SCANS;
 use codex_core_skills::loader::SkillRoot;
 use codex_core_skills::loader::load_skills_from_roots;
 use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::ExecutorFileSystemFuture;
 use codex_exec_server::FileMetadata;
@@ -18,10 +21,18 @@ use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::RemoveOptions;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::SkillScope;
 use codex_skills_extension::ExecutorSkillProvider;
+use codex_skills_extension::catalog::SkillAuthority;
+use codex_skills_extension::catalog::SkillPackageId;
+use codex_skills_extension::catalog::SkillResourceId;
+use codex_skills_extension::catalog::SkillSourceKind;
 use codex_skills_extension::provider::SkillListQuery;
 use codex_skills_extension::provider::SkillProvider;
+use codex_skills_extension::provider::SkillReadRequest;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
@@ -206,11 +217,13 @@ async fn skill_loading_and_reads_use_the_supplied_executor_file_system() {
                 canonical_root: PathUri::from_abs_path(&canonical_root),
                 has_plugin_manifest: false,
             }),
-            plugin_id: None,
+            plugin_identity: None,
             plugin_namespace: None,
             plugin_root: None,
+            discovery_mode: Default::default(),
         }],
         /*plugin_skill_snapshots*/ None,
+        Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ROOT_SCANS)),
     )
     .await;
     assert_eq!(outcome.errors, Vec::new());
@@ -226,6 +239,42 @@ async fn skill_loading_and_reads_use_the_supplied_executor_file_system() {
     assert_eq!(
         loaded.read_skill_text(&skill).await.expect("skill body"),
         SKILL_CONTENTS
+    );
+}
+
+#[tokio::test]
+async fn windows_executor_skill_read_rejects_disabled_sandbox_on_any_orchestrator() {
+    let provider = ExecutorSkillProvider::new_with_restriction_product(
+        Arc::new(EnvironmentManager::default_for_tests()),
+        /*restriction_product*/ None,
+    );
+    let sandbox = FileSystemSandboxContext::from_permission_profile(
+        PermissionProfile::from_runtime_permissions(
+            &FileSystemSandboxPolicy::restricted(Vec::new()),
+            NetworkSandboxPolicy::Restricted,
+        ),
+    );
+    let resource = SkillResourceId::environment(
+        "skill://windows-root/C:/skill/SKILL.md",
+        "local",
+        PathUri::parse("file:///C:/skill/SKILL.md").expect("Windows resource URI"),
+    );
+    let error = provider
+        .read(SkillReadRequest {
+            authority: SkillAuthority::new(SkillSourceKind::Executor, "windows-root"),
+            package: SkillPackageId("skill://windows-root/C:/skill".into()),
+            resource,
+            resolved_executor_roots: Vec::new(),
+            sandbox: Some(sandbox),
+            host_snapshot: None,
+            mcp_resources: None,
+        })
+        .await
+        .expect_err("disabled Windows sandbox must fail closed");
+
+    assert_eq!(
+        error.message,
+        "executor skill resource requires an unavailable filesystem sandbox"
     );
 }
 
@@ -260,11 +309,13 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
                     },
                 })
                 .collect(),
+            resolved_executor_roots: Vec::new(),
             host_snapshot: None,
             include_host_skills: false,
             include_bundled_skills: true,
             include_orchestrator_skills: false,
             mcp_resources: None,
+            executor_capability_discovery: None,
         })
         .await
         .expect("list executor skills");
@@ -295,6 +346,135 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
             ),
         ]
     );
+
+    std::fs::remove_dir_all(test_root).expect("remove skill directory");
+}
+
+#[tokio::test]
+async fn high_level_discovery_reuses_materialized_skill_contents_for_reads() {
+    let test_root = create_local_skill_root("materialized").expect("create local skill root");
+    let manager = Arc::new(EnvironmentManager::default_for_tests());
+    let provider = ExecutorSkillProvider::new_with_restriction_product(
+        Arc::clone(&manager),
+        /*restriction_product*/ None,
+    );
+    let executor_roots = vec![SelectedCapabilityRoot {
+        id: "materialized-root".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: "local".to_string(),
+            path: PathUri::from_host_native_path(&test_root).expect("skill root URI"),
+        },
+    }];
+    let executor_capability_discovery = ExecutorCapabilityDiscoveryCache::new(manager)
+        .snapshot(&executor_roots, &Default::default())
+        .await;
+    let catalog = provider
+        .list(SkillListQuery {
+            turn_id: "turn-1".to_string(),
+            executor_roots,
+            resolved_executor_roots: Vec::new(),
+            host_snapshot: None,
+            include_host_skills: false,
+            include_bundled_skills: true,
+            include_orchestrator_skills: false,
+            mcp_resources: None,
+            executor_capability_discovery: Some(executor_capability_discovery),
+        })
+        .await
+        .expect("list executor skills");
+    let [entry] = catalog.entries.as_slice() else {
+        panic!("expected exactly one skill");
+    };
+    let request = SkillReadRequest {
+        authority: entry.authority.clone(),
+        package: entry.id.clone(),
+        resource: entry.main_prompt.clone(),
+        resolved_executor_roots: Vec::new(),
+        sandbox: None,
+        host_snapshot: None,
+        mcp_resources: None,
+    };
+
+    std::fs::remove_dir_all(&test_root).expect("remove skill directory after discovery");
+    let read = provider
+        .read(request)
+        .await
+        .expect("read materialized executor skill");
+
+    assert_eq!(read.contents, SKILL_CONTENTS);
+}
+
+#[tokio::test]
+async fn high_level_discovery_cache_separates_filesystem_permission_contexts() {
+    let test_root = create_local_skill_root("permission-context").expect("create local skill root");
+    let manager = Arc::new(EnvironmentManager::default_for_tests());
+    let cache = ExecutorCapabilityDiscoveryCache::new(manager);
+    let executor_roots = vec![SelectedCapabilityRoot {
+        id: "permission-root".to_string(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: "local".to_string(),
+            path: PathUri::from_host_native_path(&test_root).expect("skill root URI"),
+        },
+    }];
+    cache.snapshot(&executor_roots, &HashMap::new()).await;
+
+    let updated_contents =
+        "---\nname: synthetic\ndescription: Updated executor skill.\n---\n\nUPDATED_BODY\n";
+    std::fs::write(test_root.join("skill/SKILL.md"), updated_contents)
+        .expect("update executor skill");
+    let sandbox_contexts = HashMap::from([(
+        "local".to_string(),
+        FileSystemSandboxContext::from_permission_profile(PermissionProfile::Disabled),
+    )]);
+    let second_snapshot = cache.snapshot(&executor_roots, &sandbox_contexts).await;
+    let second_discovery = second_snapshot.roots()[0]
+        .result
+        .as_ref()
+        .expect("second discovery");
+
+    assert_eq!(
+        second_discovery.skills[0].instructions.contents,
+        updated_contents
+    );
+    assert_eq!(second_snapshot.sandbox_contexts(), &sandbox_contexts);
+
+    let restored_contents =
+        "---\nname: synthetic\ndescription: Restored executor skill.\n---\n\nRESTORED_BODY\n";
+    std::fs::write(test_root.join("skill/SKILL.md"), restored_contents)
+        .expect("restore executor skill");
+    let restored_snapshot = cache.snapshot(&executor_roots, &HashMap::new()).await;
+    let restored_discovery = restored_snapshot.roots()[0]
+        .result
+        .as_ref()
+        .expect("restored discovery");
+
+    assert_eq!(
+        restored_discovery.skills[0].instructions.contents,
+        restored_contents
+    );
+
+    std::fs::remove_dir_all(test_root).expect("remove skill directory");
+}
+
+#[tokio::test]
+async fn high_level_discovery_batches_more_than_128_roots() {
+    let test_root = create_local_skill_root("many-roots").expect("create local skill root");
+    let manager = Arc::new(EnvironmentManager::default_for_tests());
+    let cache = ExecutorCapabilityDiscoveryCache::new(manager);
+    let executor_roots = (0..129)
+        .map(|index| SelectedCapabilityRoot {
+            id: format!("root-{index}"),
+            location: CapabilityRootLocation::Environment {
+                environment_id: "local".to_string(),
+                path: PathUri::from_host_native_path(&test_root).expect("skill root URI"),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let snapshot = cache.snapshot(&executor_roots, &HashMap::new()).await;
+
+    assert_eq!(snapshot.roots().len(), executor_roots.len());
+    assert!(snapshot.roots().iter().all(|root| root.result.is_ok()));
 
     std::fs::remove_dir_all(test_root).expect("remove skill directory");
 }

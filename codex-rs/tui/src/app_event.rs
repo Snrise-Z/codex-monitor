@@ -9,7 +9,10 @@
 //! quits without reaching into the app loop or coupling to shutdown/exit sequencing.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use crate::inline_visualization::InlineVisualizationContext;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
@@ -27,13 +30,16 @@ use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_connectors::AppInfo;
 use codex_file_search::FileMatch;
+use codex_message_history::HistoryBatchCursor;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
+use uuid::Uuid;
 
 use crate::app_command::AppCommand;
 use crate::app_server_session::AppServerStartedThread;
@@ -63,11 +69,37 @@ pub(crate) enum ThreadGoalSetMode {
     },
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct HistoryLookupResponse {
+/// One absolute history offset returned by a batch lookup.
+///
+/// Malformed rows retain their offset with `entry` set to `None` so the composer can cache the gap
+/// without shifting every older record.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HistoryBatchEntryResponse {
     pub(crate) offset: usize,
-    pub(crate) log_id: u64,
     pub(crate) entry: Option<String>,
+}
+
+/// Persistent-history data routed back to the thread that requested it.
+///
+/// Batch responses preserve absolute offsets and malformed-row gaps so the composer can cache the
+/// data independently of whichever search query is active when the response arrives.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum HistoryLookupResponse {
+    Entry {
+        offset: usize,
+        log_id: u64,
+        entry: Option<String>,
+    },
+    Batch {
+        cursor: HistoryBatchCursor,
+        log_id: u64,
+        entries: Vec<HistoryBatchEntryResponse>,
+        next_older_cursor: Option<HistoryBatchCursor>,
+    },
+    BatchError {
+        cursor: HistoryBatchCursor,
+        log_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +152,8 @@ pub(crate) struct PluginRemoteSectionError {
 /// invocation and must call `finish_status_rate_limit_refresh` when done so the
 /// card stops showing a "refreshing" state. A `UsageMenu` refreshes a cached
 /// zero reset count so the disabled menu entry can become available without a
-/// restart.
+/// restart. A `ResetPicker` refreshes the rate limits and detailed reset-credit
+/// rows before showing redemption choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RateLimitRefreshOrigin {
     /// Eagerly fetched after bootstrap for `/status` data and reset availability.
@@ -130,6 +163,8 @@ pub(crate) enum RateLimitRefreshOrigin {
     StatusCommand { request_id: u64 },
     /// User reopened `/usage` while the cached reset-credit count was zero.
     UsageMenu { request_id: u64 },
+    /// User opened the reset-credit picker.
+    ResetPicker { request_id: u64 },
     /// Refresh requested after a reset credit was successfully consumed.
     ResetConsume { request_id: u64 },
 }
@@ -146,6 +181,12 @@ pub(crate) enum KeymapEditIntent {
 pub(crate) enum AppEvent {
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
+    /// Merge a completed root-scoped agent-picker refresh without blocking terminal input.
+    AgentPickerThreadsLoaded {
+        primary_thread_id: ThreadId,
+        request_id: Uuid,
+        result: Result<Vec<Thread>, String>,
+    },
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
 
@@ -161,12 +202,13 @@ pub(crate) enum AppEvent {
         op: AppCommand,
     },
 
-    /// Interrupt, roll back, and retry a safety-buffered turn with the server-selected model.
+    /// Interrupt, fork, and retry a safety-buffered turn with the server-selected model.
     RetrySafetyBufferedTurn {
         thread_id: ThreadId,
         turn_id: String,
         model: String,
         turn: AppCommand,
+        prompt: UserMessage,
     },
 
     /// Deliver a synthetic history lookup response to a specific thread channel.
@@ -194,8 +236,17 @@ pub(crate) enum AppEvent {
         log_id: u64,
     },
 
-    /// Start a new session.
-    NewSession,
+    /// Fetch a bounded batch of persistent history entries for reverse search.
+    LookupMessageHistoryBatch {
+        thread_id: ThreadId,
+        cursor: HistoryBatchCursor,
+        log_id: u64,
+    },
+
+    /// Start a new session, optionally assigning it a name.
+    NewSession {
+        name: Option<String>,
+    },
 
     /// Result of the fresh startup thread that is attached after the input UI is live.
     StartupThreadStarted {
@@ -204,7 +255,9 @@ pub(crate) enum AppEvent {
 
     /// Clear the terminal UI (screen + scrollback), start a fresh session, and keep the
     /// previous chat resumable.
-    ClearUi,
+    ClearUi {
+        name: Option<String>,
+    },
 
     /// Re-render the transcript using the selected scrollback rendering mode.
     RawOutputModeChanged {
@@ -234,8 +287,17 @@ pub(crate) enum AppEvent {
     /// Permanently delete the current active main thread and exit after it succeeds.
     DeleteCurrentThread,
 
-    /// Fork the current session into a new thread.
-    ForkCurrentSession,
+    /// Fork the current session into a new thread, optionally assigning it a name.
+    ForkCurrentSession {
+        name: Option<String>,
+    },
+
+    /// Branch before a selected prompt and reopen it in the new thread's composer.
+    ForkSessionForPromptEdit {
+        thread_id: ThreadId,
+        nth_user_message: usize,
+        prompt: UserMessage,
+    },
 
     /// Request to exit the application.
     ///
@@ -255,9 +317,6 @@ pub(crate) enum AppEvent {
     /// Forward a command to the Agent. Using an `AppEvent` for this avoids
     /// bubbling channels through layers of widgets.
     CodexOp(AppCommand),
-
-    /// Restore an output-free interrupted turn into the composer and roll it back.
-    RestoreCancelledTurn(UserMessage),
 
     /// Approve one retry of a recent auto-review denial selected in the TUI.
     ApproveRecentAutoReviewDenial {
@@ -314,6 +373,7 @@ pub(crate) enum AppEvent {
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
         origin: RateLimitRefreshOrigin,
+        hard_stop_generation: u64,
         result: Result<GetAccountRateLimitsResponse, String>,
     },
 
@@ -323,21 +383,27 @@ pub(crate) enum AppEvent {
     /// Open the reset-credit flow selected from the `/usage` menu.
     OpenRateLimitResetCredits,
 
-    /// Result of reading the current reset-credit balance.
-    RateLimitResetCreditsLoaded {
-        request_id: u64,
-        result: Result<GetAccountRateLimitsResponse, String>,
+    /// Confirm the reset credit selected from the reset-credit picker.
+    OpenRateLimitResetConfirmation {
+        picker_request_id: u64,
+        confirmation_gate: Arc<AtomicBool>,
+        credit_id: Option<String>,
+        reset_title: String,
+        reset_detail: Option<String>,
+        reset_description: String,
     },
 
     /// Consume one reset credit using a stable idempotency key.
     ConsumeRateLimitResetCredit {
         idempotency_key: String,
+        credit_id: Option<String>,
     },
 
     /// Result of consuming one reset credit.
     RateLimitResetCreditConsumed {
         request_id: u64,
         idempotency_key: String,
+        credit_id: Option<String>,
         result: Result<ConsumeAccountRateLimitResetCreditResponse, String>,
     },
 
@@ -683,6 +749,7 @@ pub(crate) enum AppEvent {
     ConsolidateAgentMessage {
         source: String,
         cwd: PathBuf,
+        inline_visualization_context: Option<InlineVisualizationContext>,
         scrollback_reflow: ConsolidationScrollbackReflow,
         deferred_history_cell: Option<Box<dyn HistoryCell>>,
     },
@@ -693,15 +760,6 @@ pub(crate) enum AppEvent {
     /// Emitted by `ChatWidget::on_plan_item_completed` after plan stream
     /// finalization.
     ConsolidateProposedPlan(String),
-
-    /// Apply rollback semantics to local transcript cells.
-    ///
-    /// This is emitted when rollback was not initiated by the current
-    /// backtrack flow so trimming occurs in AppEvent queue order relative to
-    /// inserted history cells.
-    ApplyThreadRollback {
-        num_turns: u32,
-    },
 
     StartCommitAnimation,
     StopCommitAnimation,
@@ -740,6 +798,17 @@ pub(crate) enum AppEvent {
     /// Open the reasoning selection popup after picking a model.
     OpenReasoningPopup {
         model: ModelPreset,
+    },
+
+    /// Open the explicit Max/Ultra reasoning selection popup for a model.
+    OpenAdvancedReasoningPopup {
+        model: ModelPreset,
+    },
+
+    /// Apply an advanced reasoning effort to the active conversation without changing defaults.
+    ApplyAdvancedReasoning {
+        model: String,
+        effort: ReasoningEffort,
     },
 
     /// Open the Plan-mode reasoning scope prompt for the selected model/effort.
@@ -854,9 +923,6 @@ pub(crate) enum AppEvent {
     /// Clear all persisted local memory artifacts via the app-server.
     ResetMemories,
 
-    /// Update whether the full access warning prompt has been acknowledged.
-    UpdateFullAccessWarningAcknowledged(bool),
-
     /// Update whether the world-writable directories warning has been acknowledged.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     UpdateWorldWritableWarningAcknowledged(bool),
@@ -866,9 +932,6 @@ pub(crate) enum AppEvent {
 
     /// Update the Plan-mode-specific reasoning effort in memory.
     UpdatePlanModeReasoningEffort(Option<ReasoningEffort>),
-
-    /// Persist the acknowledgement flag for the full access warning prompt.
-    PersistFullAccessWarningAcknowledged,
 
     /// Persist the acknowledgement flag for the world-writable directories warning.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]

@@ -132,7 +132,12 @@ impl ChatWidget {
     }
 
     fn slash_command_blocked_by_active_task(&self, cmd: SlashCommand) -> bool {
-        (!cmd.available_during_task() && self.bottom_pane.is_task_running())
+        (!cmd.available_during_task()
+            && (self.turn_lifecycle.agent_turn_running
+                || self.review.is_review_mode
+                || (self.bottom_pane.is_task_running()
+                    && (self.mcp_startup_status.is_none()
+                        || self.input_queue.user_turn_pending_start))))
             || (cmd == SlashCommand::Resume
                 && (self.input_queue.user_turn_pending_start
                     || self.turn_lifecycle.agent_turn_running))
@@ -171,7 +176,7 @@ impl ChatWidget {
                 self.request_redraw();
             }
             SlashCommand::New => {
-                self.app_event_tx.send(AppEvent::NewSession);
+                self.app_event_tx.send(AppEvent::NewSession { name: None });
             }
             SlashCommand::Archive => {
                 self.bottom_pane.show_selection_view(SelectionViewParams {
@@ -231,13 +236,14 @@ impl ChatWidget {
                 self.request_redraw();
             }
             SlashCommand::Clear => {
-                self.app_event_tx.send(AppEvent::ClearUi);
+                self.app_event_tx.send(AppEvent::ClearUi { name: None });
             }
             SlashCommand::Resume => {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
             }
             SlashCommand::Fork => {
-                self.app_event_tx.send(AppEvent::ForkCurrentSession);
+                self.app_event_tx
+                    .send(AppEvent::ForkCurrentSession { name: None });
             }
             SlashCommand::App => {
                 let Some(thread_id) = self.thread_id else {
@@ -254,14 +260,22 @@ impl ChatWidget {
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
             SlashCommand::Compact => {
+                if self.blocks_direct_input {
+                    self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
+                    return;
+                }
                 self.clear_token_usage();
                 if !self.bottom_pane.is_task_running() {
                     self.bottom_pane.set_task_running(/*running*/ true);
                 }
+                self.input_queue.user_turn_pending_start = true;
                 self.app_event_tx.compact();
             }
             SlashCommand::Review => {
                 self.open_review_popup();
+                if self.mcp_startup_status.is_some() {
+                    self.defer_input_until_settings_applied();
+                }
             }
             SlashCommand::Rename => {
                 self.session_telemetry
@@ -721,6 +735,21 @@ impl ChatWidget {
                 };
                 self.app_event_tx.set_thread_name(name);
             }
+            SlashCommand::New if !trimmed.is_empty() => {
+                self.app_event_tx.send(AppEvent::NewSession {
+                    name: Some(trimmed.to_string()),
+                });
+            }
+            SlashCommand::Clear if !trimmed.is_empty() => {
+                self.app_event_tx.send(AppEvent::ClearUi {
+                    name: Some(trimmed.to_string()),
+                });
+            }
+            SlashCommand::Fork if !trimmed.is_empty() => {
+                self.app_event_tx.send(AppEvent::ForkCurrentSession {
+                    name: Some(trimmed.to_string()),
+                });
+            }
             SlashCommand::Plan if !trimmed.is_empty() => {
                 if !self.apply_plan_slash_command() {
                     return;
@@ -735,7 +764,8 @@ impl ChatWidget {
                 );
                 if self.is_session_configured() {
                     self.reasoning_buffer.clear();
-                    self.full_reasoning_buffer.clear();
+                    self.reasoning_header = None;
+                    self.reasoning_summary_parts.clear();
                     self.set_status_header(String::from("Working"));
                     self.submit_user_message(user_message);
                 } else {

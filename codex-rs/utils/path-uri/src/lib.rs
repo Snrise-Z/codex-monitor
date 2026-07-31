@@ -4,6 +4,7 @@
 
 use base64::Engine;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_absolute_path::normalize_windows_device_path;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -38,8 +39,9 @@ const BAD_PATH_URI_PREFIX: &str = "file:///%00/bad/path/";
 /// created by [`Self::from_abs_path`] are opaque to these lexical operations.
 ///
 /// `file:` paths retain their URI spelling so they can be parsed independently
-/// of the current host. A local POSIX `file:` URI can also retain
-/// percent-encoded non-UTF-8 bytes for lossless native round trips.
+/// of the current host, except that Windows drive letters are canonicalized to
+/// uppercase. A local POSIX `file:` URI can also retain percent-encoded non-UTF-8
+/// bytes for lossless native round trips.
 ///
 /// Like [VS Code resources], path operations use `/` URI separators on every
 /// host. Lexical path operations preserve a URL authority without interpreting
@@ -281,19 +283,59 @@ impl PathUri {
         path_segments.starts_with(&base_segments)
     }
 
+    /// Returns the decoded relative path from `base` to this URI.
+    ///
+    /// The result uses the separators of the inferred path convention,
+    /// independently of the current host. Both URIs must use the same inferred
+    /// path convention and authority, and this URI must be lexically equal to
+    /// or below `base`. Percent-encoded native path separators fail closed.
+    /// Opaque fallback URIs created by [`Self::from_abs_path`] are only relative
+    /// to themselves.
+    pub fn relative_path_from(&self, base: &Self) -> Option<String> {
+        if self == base {
+            return Some(String::new());
+        }
+        if decode_bad_path_uri(&self.0).is_some()
+            || decode_bad_path_uri(&base.0).is_some()
+            || self.0.host_str() != base.0.host_str()
+            || self.infer_path_convention() != base.infer_path_convention()
+        {
+            return None;
+        }
+
+        let convention = self.infer_path_convention()?;
+        let path_segments = containment_path_segments(&self.0, convention)?;
+        let base_segments = containment_path_segments(&base.0, convention)?;
+        let relative_segments = path_segments.strip_prefix(base_segments.as_slice())?;
+        let separator = match convention {
+            PathConvention::Posix => "/",
+            PathConvention::Windows => "\\",
+        };
+        Some(
+            relative_segments
+                .iter()
+                .map(|segment| decode_uri_path(segment))
+                .collect::<Vec<_>>()
+                .join(separator),
+        )
+    }
+
     /// Lexically resolves native absolute or relative path text against this URI.
     ///
     /// Path text is interpreted using the POSIX or Windows convention inferred
     /// from the base URI. An absolute path replaces the base URI's path, while a
     /// relative path is appended lexically. Windows root-relative paths retain
-    /// the base drive or UNC share, while drive-relative paths are rejected.
+    /// the base drive or UNC share. Same-drive relative paths are appended to
+    /// the base, while other-drive relative paths are rejected because their
+    /// current directory belongs to the executor.
     /// Empty and `.` segments are ignored, while `..` removes one segment
     /// without escaping the POSIX root, Windows drive, or UNC share. Literal
     /// `%`, `?`, and `#` characters are percent-encoded as filename text. Paths
     /// containing a null character are rejected because they cannot be safely
     /// converted to native paths.
     /// Opaque fallback URIs created by [`Self::from_abs_path`] reject non-empty
-    /// joins.
+    /// joins. Home-directory expansion also requires executor-native context
+    /// and is intentionally not performed.
     pub fn join(&self, path: &str) -> Result<Self, PathUriParseError> {
         if path.contains('\0') {
             return Err(PathUriParseError::InvalidFileUriPath {
@@ -314,13 +356,26 @@ impl PathUri {
             return Ok(absolute);
         }
         let path_bytes = path.as_bytes();
-        if convention == PathConvention::Windows
+        let path = if convention == PathConvention::Windows
             && matches!(path_bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
         {
-            return Err(PathUriParseError::InvalidFileUriPath {
-                path: path.to_string(),
-            });
-        }
+            let same_drive = self
+                .0
+                .path_segments()
+                .and_then(|mut segments| segments.find(|segment| !segment.is_empty()))
+                .is_some_and(|segment| {
+                    matches!(segment.as_bytes(), [drive, b':'] if drive.eq_ignore_ascii_case(&path_bytes[0]))
+                });
+            if !same_drive {
+                return Err(PathUriParseError::InvalidFileUriPath {
+                    path: path.to_string(),
+                });
+            }
+            &path[2..]
+        } else {
+            path
+        };
+        let path_bytes = path.as_bytes();
         if decode_bad_path_uri(&self.0).is_some() {
             return Err(PathUriParseError::InvalidFileUriPath {
                 path: self.to_string(),
@@ -453,6 +508,7 @@ impl TryFrom<Url> for PathUri {
         }
         validate_file_url(&url)?;
         let url = without_localhost_authority(url);
+        let url = with_normalized_windows_drive_letter(url);
         Ok(Self(url))
     }
 }
@@ -521,6 +577,32 @@ fn without_localhost_authority(mut url: Url) -> Url {
             unreachable!("validated file URLs can remove a localhost authority");
         };
     }
+    url
+}
+
+fn with_normalized_windows_drive_letter(mut url: Url) -> Url {
+    if url.host_str().is_some() {
+        return url;
+    }
+
+    let path = url.path();
+    let Some(drive_start) = path.bytes().position(|byte| byte != b'/') else {
+        return url;
+    };
+    let Some(drive) = path[drive_start..].split('/').next() else {
+        return url;
+    };
+    if !is_windows_drive_uri_segment(drive) || drive.as_bytes()[0].is_ascii_uppercase() {
+        return url;
+    }
+
+    let drive_letter = char::from(drive.as_bytes()[0]).to_ascii_uppercase();
+    let normalized_path = format!(
+        "{}{drive_letter}{}",
+        &path[..drive_start],
+        &path[drive_start + 1..]
+    );
+    url.set_path(&normalized_path);
     url
 }
 
@@ -596,6 +678,30 @@ fn parse_posix_path(path: &str) -> Option<PathUri> {
 }
 
 fn parse_windows_path(path: &str) -> Option<PathUri> {
+    if let Some(normalized_path) = normalize_windows_device_path(path) {
+        if let Some(unc_path) = normalized_path.strip_prefix(r"\\") {
+            let mut components = unc_path.split(is_windows_separator_char);
+            if matches!(components.next(), None | Some("" | "." | ".."))
+                || matches!(components.next(), None | Some("" | "." | ".."))
+            {
+                return Some(windows_opaque_path_uri(path));
+            }
+        }
+        return Some(
+            parse_unnormalized_windows_path(&normalized_path)
+                .filter(|uri| {
+                    uri.infer_path_convention() == Some(PathConvention::Windows)
+                        && uri.opaque_fallback_bytes().is_none()
+                        && (!normalized_path.starts_with(r"\\")
+                            || uri.0.host_str().is_some_and(|host| !host.is_empty()))
+                })
+                .unwrap_or_else(|| windows_opaque_path_uri(path)),
+        );
+    }
+    parse_unnormalized_windows_path(path)
+}
+
+fn parse_unnormalized_windows_path(path: &str) -> Option<PathUri> {
     let bytes = path.as_bytes();
     let uses_namespace = matches!(
         bytes,

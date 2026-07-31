@@ -22,12 +22,13 @@ use crate::protocol::EventMsg;
 use crate::state_db;
 use codex_file_search as file_search;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+use codex_protocol::protocol::user_message_preview;
 use serde_json::Value;
 
 /// Returned page of thread (thread) summaries.
@@ -54,6 +55,8 @@ pub struct ThreadItem {
     pub first_user_message: Option<String>,
     /// Best available user-facing preview for discovery and list display.
     pub preview: Option<String>,
+    /// The user-selected section in SQLite-owned metadata.
+    pub section: Option<codex_state::ThreadSection>,
     /// Working directory from session metadata.
     pub cwd: Option<PathBuf>,
     /// Git branch from session metadata.
@@ -829,6 +832,7 @@ async fn build_thread_item(
             thread_id,
             first_user_message,
             preview,
+            section: None,
             cwd,
             git_branch,
             git_sha,
@@ -1184,12 +1188,19 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             }
             RolloutItem::EventMsg(ev) => {
                 if let Some(preview) = event_msg_preview(&ev) {
+                    // Legacy rollouts persist UserMessage while paginated rollouts persist
+                    // ItemCompleted(UserMessage), so summaries must recognize both formats.
+                    let is_user_message = match &ev {
+                        EventMsg::UserMessage(_) => true,
+                        EventMsg::ItemCompleted(event) => {
+                            matches!(event.item, TurnItem::UserMessage(_))
+                        }
+                        _ => false,
+                    };
                     if summary.preview.is_none() {
                         summary.preview = Some(preview.clone());
                     }
-                    if let EventMsg::UserMessage(_) = ev
-                        && summary.first_user_message.is_none()
-                    {
+                    if is_user_message && summary.first_user_message.is_none() {
                         summary.first_user_message = Some(preview);
                     }
                 }
@@ -1250,30 +1261,15 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
     Ok(head)
 }
 
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
-    }
-}
-
 fn event_msg_preview(event: &EventMsg) -> Option<String> {
     match event {
-        EventMsg::UserMessage(user) => {
-            let message = strip_user_message_prefix(user.message.as_str());
-            if !message.is_empty() {
-                return Some(message.to_string());
+        EventMsg::UserMessage(user) => user_message_preview(user),
+        EventMsg::ItemCompleted(event) => match &event.item {
+            TurnItem::UserMessage(user) => {
+                user_message_preview(&user.as_legacy_user_message_event())
             }
-            if user
-                .images
-                .as_ref()
-                .is_some_and(|images| !images.is_empty())
-                || !user.local_images.is_empty()
-            {
-                return Some("[Image]".to_string());
-            }
-            None
-        }
+            _ => None,
+        },
         EventMsg::ThreadGoalUpdated(event) => {
             let objective = event.goal.objective.trim();
             (!objective.is_empty()).then(|| objective.to_string())
@@ -1285,19 +1281,37 @@ fn event_msg_preview(event: &EventMsg) -> Option<String> {
 /// Read the SessionMetaLine from the head of a rollout file for reuse by
 /// callers that need the session metadata (e.g. to derive a cwd for config).
 pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> {
-    let head = read_head_for_summary(path).await?;
-    let Some(first) = head.first() else {
-        return Err(io::Error::other(format!(
-            "rollout at {} is empty",
-            path.display()
-        )));
-    };
-    serde_json::from_value::<SessionMetaLine>(first.clone()).map_err(|_| {
-        io::Error::other(format!(
-            "rollout at {} does not start with session metadata",
-            path.display()
-        ))
-    })
+    let mut lines = compression::open_rollout_line_reader(path).await?;
+    while let Some(line) = lines.next_line().await? {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) else {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                crate::recorder::reject_unknown_thread_history_mode(&value)?;
+            }
+            continue;
+        };
+        match rollout_line.item {
+            RolloutItem::SessionMeta(session_meta_line) => return Ok(session_meta_line),
+            RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
+                return Err(io::Error::other(format!(
+                    "rollout at {} does not start with session metadata",
+                    path.display()
+                )));
+            }
+            RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::EventMsg(_) => {}
+        }
+    }
+    Err(io::Error::other(format!(
+        "rollout at {} is empty",
+        path.display()
+    )))
 }
 
 async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>> {

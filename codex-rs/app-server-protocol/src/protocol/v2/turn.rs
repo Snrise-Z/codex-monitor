@@ -2,6 +2,8 @@ use super::ApprovalsReviewer;
 use super::AskForApproval;
 use super::SandboxPolicy;
 use super::Turn;
+use crate::JsonSchema;
+use crate::TS;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::MultiAgentMode;
@@ -16,13 +18,11 @@ use codex_protocol::user_input::TextElement as CoreTextElement;
 use codex_protocol::user_input::UserInput as CoreUserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +41,9 @@ pub enum TurnStatus {
 pub struct TurnEnvironmentParams {
     pub environment_id: String,
     pub cwd: LegacyAppPathString,
+    /// Environment-native runtime workspace roots. Omitted defaults to `cwd`.
+    #[ts(optional = nullable)]
+    pub runtime_workspace_roots: Option<Vec<LegacyAppPathString>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -305,6 +308,12 @@ pub enum UserInput {
         detail: Option<ImageDetail>,
         path: PathBuf,
     },
+    Audio {
+        url: String,
+    },
+    LocalAudio {
+        path: PathBuf,
+    },
     Skill {
         name: String,
         path: PathBuf,
@@ -330,6 +339,8 @@ impl UserInput {
                 detail,
             },
             UserInput::LocalImage { path, detail } => CoreUserInput::LocalImage { path, detail },
+            UserInput::Audio { url } => CoreUserInput::Audio { audio_url: url },
+            UserInput::LocalAudio { path } => CoreUserInput::LocalAudio { path },
             UserInput::Skill { name, path } => CoreUserInput::Skill { name, path },
             UserInput::Mention { name, path } => CoreUserInput::Mention { name, path },
         }
@@ -351,6 +362,8 @@ impl From<CoreUserInput> for UserInput {
                 detail,
             },
             CoreUserInput::LocalImage { path, detail } => UserInput::LocalImage { path, detail },
+            CoreUserInput::Audio { audio_url } => UserInput::Audio { url: audio_url },
+            CoreUserInput::LocalAudio { path } => UserInput::LocalAudio { path },
             CoreUserInput::Skill { name, path } => UserInput::Skill { name, path },
             CoreUserInput::Mention { name, path } => UserInput::Mention { name, path },
             _ => unreachable!("unsupported user input variant"),
@@ -364,6 +377,8 @@ impl UserInput {
             UserInput::Text { text, .. } => text.chars().count(),
             UserInput::Image { .. }
             | UserInput::LocalImage { .. }
+            | UserInput::Audio { .. }
+            | UserInput::LocalAudio { .. }
             | UserInput::Skill { .. }
             | UserInput::Mention { .. } => 0,
         }

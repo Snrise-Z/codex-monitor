@@ -1,7 +1,10 @@
 use crate::ClientNotification;
 use crate::ClientRequest;
+use crate::JsonSchema;
 use crate::ServerNotification;
+use crate::ServerNotificationEnvelope;
 use crate::ServerRequest;
+use crate::TS;
 use crate::experimental_api::experimental_fields;
 use crate::export_client_notification_schemas;
 use crate::export_client_param_schemas;
@@ -21,7 +24,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_protocol::protocol::RolloutLine;
-use schemars::JsonSchema;
 use schemars::schema_for;
 use serde::Serialize;
 use serde_json::Map;
@@ -37,15 +39,18 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use ts_rs::TS;
 
 pub(crate) const GENERATED_TS_HEADER: &str = "// GENERATED CODE! DO NOT MODIFY BY HAND!\n\n";
 const IGNORED_DEFINITIONS: &[&str] = &["Option<()>"];
 const JSON_V1_ALLOWLIST: &[&str] = &["InitializeParams", "InitializeResponse"];
 const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
+    "EnvironmentShellInfo",
+    "EnvironmentStatusKind",
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
+    "ThreadSearchOccurrence",
+    "ThreadSearchTextRange",
 ];
 const SPECIAL_DEFINITIONS: &[&str] = &[
     "ClientNotification",
@@ -56,7 +61,8 @@ const SPECIAL_DEFINITIONS: &[&str] = &[
 const FLAT_V2_SHARED_DEFINITIONS: &[&str] = &["ClientRequest", "ServerNotification"];
 const V1_CLIENT_REQUEST_METHODS: &[&str] =
     &["getConversationSummary", "gitDiffToRemote", "getAuthStatus"];
-const EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON: &[&str] = &["rawResponseItem/completed"];
+const EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON: &[&str] =
+    &["rawResponseItem/completed", "rawResponse/completed"];
 
 #[derive(Clone)]
 pub struct GeneratedSchema {
@@ -81,11 +87,6 @@ impl GeneratedSchema {
 }
 
 type JsonSchemaEmitter = fn(&Path) -> Result<GeneratedSchema>;
-pub fn generate_types(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
-    generate_ts(out_dir, prettier)?;
-    generate_json(out_dir)?;
-    Ok(())
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GenerateTsOptions {
@@ -106,10 +107,6 @@ impl Default for GenerateTsOptions {
     }
 }
 
-pub fn generate_ts(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
-    generate_ts_with_options(out_dir, prettier, GenerateTsOptions::default())
-}
-
 pub fn generate_ts_with_options(
     out_dir: &Path,
     prettier: Option<&Path>,
@@ -126,6 +123,7 @@ pub fn generate_ts_with_options(
     ServerRequest::export_all_to(out_dir)?;
     export_server_responses(out_dir)?;
     ServerNotification::export_all_to(out_dir)?;
+    ServerNotificationEnvelope::export_all_to(out_dir)?;
 
     if !options.experimental_api {
         filter_experimental_ts(out_dir)?;
@@ -1337,6 +1335,7 @@ where
             strip_v1_client_request_variants_from_json_schema(&mut schema_value);
         } else if file_stem == "ServerNotification" {
             strip_v1_server_notification_variants_from_json_schema(&mut schema_value);
+            add_server_notification_emitted_at_to_json_schema(&mut schema_value)?;
         }
         enforce_numbered_definition_collision_overrides(file_stem, &mut schema_value);
         annotate_schema(&mut schema_value, Some(file_stem));
@@ -1367,6 +1366,25 @@ where
         logical_name: logical_name.to_string(),
         value: schema_value,
     })
+}
+
+fn add_server_notification_emitted_at_to_json_schema(schema: &mut Value) -> Result<()> {
+    let schema = schema
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("expected ServerNotification schema to be an object"))?;
+    schema.insert(
+        "properties".to_string(),
+        serde_json::json!({
+            "emittedAtMs": {
+                "description": "Unix timestamp (in milliseconds) when app-server emitted this notification.",
+                "format": "int64",
+                "type": "integer"
+            }
+        }),
+    );
+    // Keep this optional in generated client schemas for compatibility with
+    // older app-server versions. New servers still always emit it.
+    Ok(())
 }
 
 fn enforce_numbered_definition_collision_overrides(schema_name: &str, schema: &mut Value) {

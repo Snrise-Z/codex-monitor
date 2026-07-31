@@ -80,10 +80,12 @@ impl App {
     ) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
+        let hard_stop_generation = self.rate_limit_hard_stop_generation;
         tokio::spawn(async move {
             let request = fetch_account_rate_limits(request_handle);
             let result = match origin {
-                RateLimitRefreshOrigin::ResetConsume { .. } => {
+                RateLimitRefreshOrigin::ResetConsume { .. }
+                | RateLimitRefreshOrigin::ResetPicker { .. } => {
                     tokio::time::timeout(RATE_LIMIT_RESET_REQUEST_TIMEOUT, request)
                         .await
                         .map_err(|_| "account/rateLimits/read timed out in TUI".to_string())
@@ -95,7 +97,11 @@ impl App {
                     request.await.map_err(|err| err.to_string())
                 }
             };
-            app_event_tx.send(AppEvent::RateLimitsLoaded { origin, result });
+            app_event_tx.send(AppEvent::RateLimitsLoaded {
+                origin,
+                hard_stop_generation,
+                result,
+            });
         });
     }
 
@@ -118,37 +124,23 @@ impl App {
         });
     }
 
-    pub(super) fn refresh_rate_limit_reset_credits(
-        &mut self,
-        app_server: &AppServerSession,
-        request_id: u64,
-    ) {
-        let request_handle = app_server.request_handle();
-        let app_event_tx = self.app_event_tx.clone();
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                RATE_LIMIT_RESET_REQUEST_TIMEOUT,
-                fetch_account_rate_limits(request_handle),
-            )
-            .await
-            .map_err(|_| "account/rateLimits/read timed out in TUI".to_string())
-            .and_then(|result| result.map_err(|err| err.to_string()));
-            app_event_tx.send(AppEvent::RateLimitResetCreditsLoaded { request_id, result });
-        });
-    }
-
     pub(super) fn consume_rate_limit_reset_credit(
         &mut self,
         app_server: &AppServerSession,
         request_id: u64,
         idempotency_key: String,
+        credit_id: Option<String>,
     ) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(
                 RATE_LIMIT_RESET_REQUEST_TIMEOUT,
-                consume_rate_limit_reset_credit_request(request_handle, idempotency_key.clone()),
+                consume_rate_limit_reset_credit_request(
+                    request_handle,
+                    idempotency_key.clone(),
+                    credit_id.clone(),
+                ),
             )
             .await
             .map_err(|_| "account/rateLimitResetCredit/consume timed out in TUI".to_string())
@@ -156,6 +148,7 @@ impl App {
             app_event_tx.send(AppEvent::RateLimitResetCreditConsumed {
                 request_id,
                 idempotency_key,
+                credit_id,
                 result,
             });
         });
@@ -633,7 +626,7 @@ impl App {
             {
                 guard
                     .pending_interactive_replay
-                    .note_evicted_server_request(request);
+                    .note_evicted_server_request(request.as_ref());
             }
             guard.active
         };
@@ -793,12 +786,16 @@ pub(super) async fn fetch_account_token_activity(
 pub(super) async fn consume_rate_limit_reset_credit_request(
     request_handle: AppServerRequestHandle,
     idempotency_key: String,
+    credit_id: Option<String>,
 ) -> Result<ConsumeAccountRateLimitResetCreditResponse> {
     let request_id = RequestId::String(format!("consume-rate-limit-reset-{}", Uuid::new_v4()));
     request_handle
         .request_typed(ClientRequest::ConsumeAccountRateLimitResetCredit {
             request_id,
-            params: ConsumeAccountRateLimitResetCreditParams { idempotency_key },
+            params: ConsumeAccountRateLimitResetCreditParams {
+                idempotency_key,
+                credit_id,
+            },
         })
         .await
         .wrap_err("account/rateLimitResetCredit/consume failed in TUI")
@@ -1031,6 +1028,7 @@ async fn request_plugin_list_with_marketplace_kinds(
             params: PluginListParams {
                 cwds: Some(vec![cwd]),
                 marketplace_kinds,
+                force_refetch: false,
             },
         })
         .await
@@ -1265,6 +1263,7 @@ pub(super) fn mcp_inventory_maps_from_statuses(statuses: Vec<McpServerStatus>) -
         auth_statuses.insert(
             server_name.clone(),
             match status.auth_status {
+                codex_app_server_protocol::McpAuthStatus::Unknown => McpAuthStatus::Unknown,
                 codex_app_server_protocol::McpAuthStatus::Unsupported => McpAuthStatus::Unsupported,
                 codex_app_server_protocol::McpAuthStatus::NotLoggedIn => McpAuthStatus::NotLoggedIn,
                 codex_app_server_protocol::McpAuthStatus::BearerToken => McpAuthStatus::BearerToken,

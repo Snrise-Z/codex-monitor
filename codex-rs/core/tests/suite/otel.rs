@@ -567,19 +567,25 @@ async fn process_sse_emits_completed_telemetry() {
 
     mount_sse_once(
         &server,
-        sse(vec![serde_json::json!({
-            "type": "response.completed",
-            "response": {
-                "id": "resp1",
-                "usage": {
-                    "input_tokens": 3,
-                    "input_tokens_details": { "cached_tokens": 1 },
-                    "output_tokens": 5,
-                    "output_tokens_details": { "reasoning_tokens": 2 },
-                    "total_tokens": 9
+        sse(vec![
+            ev_reasoning_item_added("reasoning-1", &[]),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp1",
+                    "usage": {
+                        "input_tokens": 3,
+                        "input_tokens_details": {
+                            "cached_tokens": 1,
+                            "cache_write_tokens": 2
+                        },
+                        "output_tokens": 5,
+                        "output_tokens_details": { "reasoning_tokens": 2 },
+                        "total_tokens": 9
+                    }
                 }
-            }
-        })]),
+            }),
+        ]),
     )
     .await;
 
@@ -610,8 +616,12 @@ async fn process_sse_emits_completed_telemetry() {
                     && line.contains("input_token_count=3")
                     && line.contains("output_token_count=5")
                     && line.contains("cached_token_count=1")
+                    && line.contains("cache_write_token_count=2")
                     && line.contains("reasoning_token_count=2")
                     && line.contains("tool_token_count=9")
+                    && extract_log_field(line, "ttft_ms")
+                        .and_then(|ttft_ms| ttft_ms.parse::<i64>().ok())
+                        .is_some()
             })
             .map(|_| Ok(()))
             .unwrap_or(Err("missing response.completed telemetry".to_string()))
@@ -640,7 +650,10 @@ async fn turn_and_completed_response_spans_record_token_usage() {
                 "id": "resp1",
                 "usage": {
                     "input_tokens": 3,
-                    "input_tokens_details": { "cached_tokens": 1 },
+                    "input_tokens_details": {
+                        "cached_tokens": 1,
+                        "cache_write_tokens": 2
+                    },
                     "output_tokens": 5,
                     "output_tokens_details": { "reasoning_tokens": 2 },
                     "total_tokens": 9
@@ -689,6 +702,7 @@ async fn turn_and_completed_response_spans_record_token_usage() {
                 && line.contains("codex.request.reasoning_effort=high")
                 && line.contains("gen_ai.usage.input_tokens=3")
                 && line.contains("gen_ai.usage.cache_read.input_tokens=1")
+                && line.contains("gen_ai.usage.cache_write.input_tokens=2")
                 && line.contains("gen_ai.usage.output_tokens=5")
                 && line.contains("codex.usage.reasoning_output_tokens=2")
                 && line.contains("codex.usage.total_tokens=9")
@@ -701,6 +715,7 @@ async fn turn_and_completed_response_spans_record_token_usage() {
                 && line.contains("codex.turn.reasoning_effort=high")
                 && line.contains("codex.turn.token_usage.input_tokens=3")
                 && line.contains("codex.turn.token_usage.cached_input_tokens=1")
+                && line.contains("codex.turn.token_usage.cache_write_input_tokens=2")
                 && line.contains("codex.turn.token_usage.non_cached_input_tokens=2")
                 && line.contains("codex.turn.token_usage.output_tokens=5")
                 && line.contains("codex.turn.token_usage.reasoning_output_tokens=2")
@@ -1550,7 +1565,7 @@ async fn handle_shell_command_user_denies_records_tool_decision() {
         .submit(Op::ExecApproval {
             id: approval.effective_approval_id(),
             turn_id: None,
-            decision: ReviewDecision::Denied,
+            decision: ReviewDecision::denied("rejected by user"),
         })
         .await
         .unwrap();
@@ -1691,7 +1706,7 @@ async fn handle_sandbox_error_user_denies_records_tool_decision() {
         .submit(Op::ExecApproval {
             id: approval.effective_approval_id(),
             turn_id: None,
-            decision: ReviewDecision::Denied,
+            decision: ReviewDecision::denied("rejected by user"),
         })
         .await
         .unwrap();

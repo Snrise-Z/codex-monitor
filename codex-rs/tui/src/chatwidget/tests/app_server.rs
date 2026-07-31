@@ -1,6 +1,9 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+const SAFETY_BUFFERING_HEADER_TEXT: &str =
+    "Our systems are thinking a bit more about this request before responding.";
+
 fn thread_settings_for_test(
     model: &str,
     thread_id: ThreadId,
@@ -42,7 +45,7 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
         forked_from_id: None,
         fork_parent_title: None,
         thread_name: None,
-        model: "gpt-5.3-codex".to_string(),
+        model: "gpt-5.2".to_string(),
         model_provider_id: "openai".to_string(),
         service_tier: None,
         approval_policy: AskForApproval::Never,
@@ -125,15 +128,31 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert_chatwidget_snapshot!("safety_buffering_retry_prompt", popup);
 
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    let (event_thread_id, event_turn_id, model, turn) = loop {
+    let opened_url = loop {
+        match rx.try_recv() {
+            Ok(AppEvent::OpenUrlInBrowser { url }) => break url,
+            Ok(_) => continue,
+            Err(err) => panic!("expected learn-more URL event: {err}"),
+        }
+    };
+    assert_eq!(opened_url, "https://help.openai.com/en/articles/20001326");
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let (event_thread_id, event_turn_id, model, turn, prompt) = loop {
         match rx.try_recv() {
             Ok(AppEvent::RetrySafetyBufferedTurn {
                 thread_id,
                 turn_id,
                 model,
                 turn,
-            }) => break (thread_id, turn_id, model, turn),
+                prompt,
+            }) => break (thread_id, turn_id, model, turn, prompt),
             Ok(_) => continue,
             Err(err) => panic!("expected safety-buffering retry event: {err}"),
         }
@@ -142,11 +161,34 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
     assert_eq!(event_turn_id, turn_id);
     assert_eq!(model, "faster-model");
     assert_matches!(turn, Op::UserTurn { .. });
-    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Additional safety checks"));
+    assert_eq!(prompt, UserMessage::from("Explain the request"));
+    assert!(
+        !render_bottom_popup(&chat, /*width*/ 80)
+            .contains("Press enter to confirm or esc to go back")
+    );
 }
 
 #[tokio::test]
-async fn safety_buffering_stops_retrying_after_agent_message_starts() {
+async fn safety_buffering_does_not_offer_retry_in_side_conversation() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_side_conversation_active(/*active*/ true);
+    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+            thread_id,
+            turn_id,
+            Some("faster-model"),
+        )),
+        /*replay_kind*/ None,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert_chatwidget_snapshot!("safety_buffering_side_conversation_without_retry", popup);
+}
+
+#[tokio::test]
+async fn safety_buffering_remains_visible_until_turn_completes() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
     chat.handle_server_notification(
@@ -162,6 +204,11 @@ async fn safety_buffering_stops_retrying_after_agent_message_starts() {
     chat.on_agent_message_delta("Visible response".to_string());
 
     assert!(!chat.can_retry_safety_buffered_turn(turn_id));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
+
+    handle_turn_completed(&mut chat, turn_id, /*duration_ms*/ None);
+
+    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
 }
 
 #[tokio::test]
@@ -196,6 +243,12 @@ async fn safety_buffering_without_retry_shows_short_app_message() {
         Some(ReplayKind::ThreadSnapshot),
     );
     assert_eq!(render_popup(&chat), popup);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        !render_bottom_popup(&chat, /*width*/ 80)
+            .contains("Press enter to confirm or esc to go back")
+    );
 }
 
 #[tokio::test]
@@ -225,14 +278,14 @@ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
         )),
         Some(ReplayKind::ResumeInitialMessages),
     );
-    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Additional safety checks"));
+    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
 
     let mut hidden = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
     chat.handle_server_notification(
         ServerNotification::ModelSafetyBufferingUpdated(hidden.clone()),
         /*replay_kind*/ None,
     );
-    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("Additional safety checks"));
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
     hidden.show_buffering_ui = false;
     chat.handle_server_notification(
         ServerNotification::ModelSafetyBufferingUpdated(hidden),
@@ -246,7 +299,7 @@ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
             .details(),
         None
     );
-    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Additional safety checks"));
+    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
 }
 
 #[tokio::test]
@@ -288,7 +341,7 @@ async fn invalid_url_elicitation_is_declined() {
 
 #[tokio::test]
 async fn thread_settings_updated_updates_visible_state_without_transcript() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     set_fast_mode_test_catalog(&mut chat);
     let thread_id = ThreadId::new();
     chat.handle_thread_session(configured_thread_session(thread_id));
@@ -344,7 +397,7 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
 
 #[tokio::test]
 async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     let thread_id = ThreadId::new();
     let mut session = configured_thread_session(thread_id);
     session.model = "gpt-default".to_string();
@@ -486,6 +539,43 @@ async fn live_app_server_user_message_item_completed_does_not_duplicate_rendered
 }
 
 #[tokio::test]
+async fn live_app_server_user_message_omits_unsupported_media() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::UserMessage {
+                id: "user-1".to_string(),
+                client_id: None,
+                content: vec![
+                    AppServerUserInput::Text {
+                        text: "Please inspect the attachments.".to_string(),
+                        text_elements: Vec::new(),
+                    },
+                    AppServerUserInput::Audio {
+                        url: "https://example.com/one.wav".to_string(),
+                    },
+                    AppServerUserInput::LocalAudio {
+                        path: test_path_buf("/tmp/two.wav"),
+                    },
+                ],
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let inserted = drain_insert_history(&mut rx);
+    assert_eq!(inserted.len(), 1);
+    assert_chatwidget_snapshot!(
+        "live_app_server_user_message_omits_unsupported_media",
+        lines_to_single_string(&inserted[0]),
+    );
+}
+
+#[tokio::test]
 async fn live_app_server_turn_completed_clears_working_status_after_answer_item() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -513,17 +603,18 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         .expect("status indicator should be visible");
     assert_eq!(status.header(), "Working");
 
+    let item = AppServerThreadItem::AgentMessage {
+        id: "msg-1".to_string(),
+        text: "Yes. What do you need?".to_string(),
+        phase: Some(MessagePhase::FinalAnswer),
+        memory_citation: None,
+    };
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             completed_at_ms: 0,
-            item: AppServerThreadItem::AgentMessage {
-                id: "msg-1".to_string(),
-                text: "Yes. What do you need?".to_string(),
-                phase: Some(MessagePhase::FinalAnswer),
-                memory_citation: None,
-            },
+            item: item.clone(),
         }),
         /*replay_kind*/ None,
     );
@@ -538,8 +629,8 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
             thread_id: "thread-1".to_string(),
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: Vec::new(),
+                items_view: codex_app_server_protocol::TurnItemsView::Summary,
+                items: vec![item],
                 status: AppServerTurnStatus::Completed,
                 error: None,
                 started_at: None,
@@ -550,8 +641,13 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         /*replay_kind*/ None,
     );
 
+    assert!(drain_insert_history(&mut rx).is_empty());
     assert!(!chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_widget().is_none());
+    assert_eq!(
+        chat.transcript.last_completed_agent_message,
+        Some(("turn-1".to_string(), "msg-1".to_string()))
+    );
 }
 
 #[tokio::test]
@@ -712,6 +808,8 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
                 command: command.clone(),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
+                plugin_id: None,
+                script_path: None,
                 source: AppServerCommandExecutionSource::UserShell,
                 status: AppServerCommandExecutionStatus::InProgress,
                 command_actions: vec![AppServerCommandAction::Unknown {
@@ -734,6 +832,8 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
                 command,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
+                plugin_id: None,
+                script_path: None,
                 source: AppServerCommandExecutionSource::UserShell,
                 status: AppServerCommandExecutionStatus::Completed,
                 command_actions: vec![AppServerCommandAction::Unknown {
@@ -757,6 +857,57 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
     assert_chatwidget_snapshot!(
         "live_app_server_command_execution_strips_shell_wrapper",
         blob
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_command_output_delta_transcript_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
+    begin_exec(&mut chat, "cmd-1", "printf 'stdout\\nstderr\\n'");
+
+    for delta in ["stdout\n", "stderr\n"] {
+        chat.handle_server_notification(
+            ServerNotification::CommandExecutionOutputDelta(
+                codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "cmd-1".to_string(),
+                    delta: delta.to_string(),
+                },
+            ),
+            /*replay_kind*/ None,
+        );
+    }
+
+    let active = active_blob(&chat);
+    assert_chatwidget_snapshot!("live_app_server_command_output_delta_active", active);
+
+    let transcript = chat
+        .active_cell_transcript_lines(/*width*/ 80)
+        .expect("active exec transcript lines");
+    assert_chatwidget_snapshot!(
+        "live_app_server_command_output_delta_transcript",
+        lines_to_single_string(&transcript)
+    );
+
+    handle_turn_interrupted(&mut chat, "turn-1");
+    let mut completed = None;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            let transcript = lines_to_single_string(&cell.transcript_lines(/*width*/ 80));
+            if transcript.contains("printf 'stdout\\nstderr\\n'") {
+                completed = Some(transcript);
+            }
+        }
+    }
+    let completed = completed.expect("expected the interrupted command in history");
+    let completed = regex_lite::Regex::new(r"(?m) • (?:\d+ms|\d+\.\d+s|\d+m \d+s)$")
+        .expect("valid duration regex")
+        .replace(&completed, " • <duration>");
+    assert_chatwidget_snapshot!(
+        "live_app_server_command_output_delta_interrupted",
+        completed
     );
 }
 
@@ -948,7 +1099,6 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
         }),
         /*replay_kind*/ None,
     );
-
     let first_cells = drain_insert_history(&mut rx);
     assert_eq!(first_cells.len(), 1);
     assert!(lines_to_single_string(&first_cells[0]).contains("permission denied"));
@@ -1010,6 +1160,64 @@ async fn live_app_server_failed_turn_consolidates_streamed_answer() {
         saw_consolidate,
         "failed turn should consolidate streamed cells before clearing the stream controller"
     );
+}
+
+#[tokio::test]
+async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    handle_turn_started(&mut chat, "turn-1");
+    while rx.try_recv().is_ok() {}
+    handle_agent_message_delta(&mut chat, "The transport kept this.\n");
+    chat.run_commit_tick();
+    while rx.try_recv().is_ok() {}
+
+    let mut completed_turn = app_server_turn(
+        "turn-1",
+        AppServerTurnStatus::Completed,
+        Some(1_000),
+        /*error*/ None,
+    );
+    completed_turn.items_view = codex_app_server_protocol::TurnItemsView::Summary;
+    completed_turn.items = vec![AppServerThreadItem::AgentMessage {
+        id: "msg-1".to_string(),
+        text: concat!(
+            "The transport kept this.\nAnd dropped this.\n\n",
+            r#"::code-comment{title="Finding" body="Keep ::git-stage{cwd=/tmp} literal." file="/tmp/file.rs"}"#,
+        )
+        .to_string(),
+        phase: Some(MessagePhase::FinalAnswer),
+        memory_citation: None,
+    }];
+    chat.handle_server_notification(
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: completed_turn,
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let consolidations = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::ConsolidateAgentMessage {
+                source,
+                scrollback_reflow,
+                ..
+            } => {
+                assert_eq!(
+                    scrollback_reflow,
+                    crate::app_event::ConsolidationScrollbackReflow::Required
+                );
+                assert_chatwidget_snapshot!(
+                    "live_app_server_turn_completion_repairs_dropped_message_deltas",
+                    source,
+                );
+                Some(())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(consolidations.len(), 1);
 }
 
 #[tokio::test]
@@ -1159,11 +1367,26 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
 
 #[tokio::test]
 async fn app_server_safety_access_errors_render_dedicated_notice() {
-    let message = "Invalid prompt: we've limited access to this content for safety reasons.";
-    for message in [
-        message.to_string(),
-        json!({ "error": { "message": message } }).to_string(),
-    ] {
+    let legacy_message = "Invalid prompt: we've limited access to this content for safety reasons.";
+    let bio_policy_message = "This content was flagged for possible biological risk.";
+    let cases = [
+        ("legacy plain message", legacy_message.to_string()),
+        (
+            "legacy JSON message",
+            json!({ "error": { "message": legacy_message } }).to_string(),
+        ),
+        ("bio policy plain message", bio_policy_message.to_string()),
+        (
+            "bio policy JSON message",
+            json!({ "error": { "message": bio_policy_message } }).to_string(),
+        ),
+        (
+            "bio policy code",
+            json!({ "error": { "code": "bio_policy", "message": "copy may change" } }).to_string(),
+        ),
+    ];
+    let mut rendered_cases = Vec::new();
+    for (case, message) in cases {
         let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
         chat.handle_non_retry_error(message, /*codex_error_info*/ None);
 
@@ -1172,8 +1395,17 @@ async fn app_server_safety_access_errors_render_dedicated_notice() {
         let rendered = lines_to_single_string(&cells[0]);
         assert!(rendered.contains("This content can't be shown"));
         assert!(rendered.contains("biological research"));
-        assert!(!rendered.contains("Invalid prompt:"));
+        rendered_cases.push((case, rendered));
     }
+
+    let canonical = &rendered_cases[0].1;
+    for (case, rendered) in &rendered_cases[1..] {
+        assert_eq!(rendered, canonical, "unexpected rendering for {case}");
+    }
+    insta::assert_snapshot!(
+        "app_server_bio_policy_error_renders_dedicated_notice",
+        rendered_cases.last().unwrap().1.as_str()
+    );
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
-use crate::terminal_hyperlinks::visible_lines;
+use crate::terminal_hyperlinks::visible_lines_ref;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crossterm::event::KeyCode;
@@ -47,7 +47,6 @@ use ratatui::text::Text;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
-use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
 
 pub(crate) enum Overlay {
@@ -113,7 +112,7 @@ fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(Vec<KeyBinding>, &st
         spans.push(Span::from(desc.to_string()));
         first = false;
     }
-    Paragraph::new(vec![Line::from(spans).dim()]).render_ref(area, buf);
+    Paragraph::new(vec![Line::from(spans).dim()]).render(area, buf);
 }
 
 /// Generic widget for rendering a pager view.
@@ -177,9 +176,9 @@ impl PagerView {
     fn render_header(&self, area: Rect, buf: &mut Buffer) {
         Span::from("/ ".repeat(area.width as usize / 2))
             .dim()
-            .render_ref(area, buf);
+            .render(area, buf);
         let header = format!("/ {}", self.title);
-        header.dim().render_ref(area, buf);
+        header.dim().render(area, buf);
     }
 
     fn render_content(&self, area: Rect, buf: &mut Buffer) {
@@ -230,7 +229,7 @@ impl PagerView {
 
         Span::from("─".repeat(sep_rect.width as usize))
             .dim()
-            .render_ref(sep_rect, buf);
+            .render(sep_rect, buf);
         let percent = if total_len == 0 {
             100
         } else {
@@ -247,7 +246,7 @@ impl PagerView {
         let pct_x = sep_rect.x + sep_rect.width - pct_w - 1;
         Span::from(pct_text)
             .dim()
-            .render_ref(Rect::new(pct_x, sep_rect.y, pct_w, 1), buf);
+            .render(Rect::new(pct_x, sep_rect.y, pct_w, 1), buf);
     }
 
     fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) -> Result<()> {
@@ -393,14 +392,23 @@ impl Renderable for CachedRenderable {
 
 struct CellRenderable {
     cell: Arc<dyn HistoryCell>,
-    style: Style,
+    highlighted: bool,
 }
 
 impl Renderable for CellRenderable {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let hyperlink_lines = self.cell.transcript_hyperlink_lines(area.width);
-        let p = Paragraph::new(Text::from(visible_lines(hyperlink_lines.clone())))
-            .style(self.style)
+        let style = if self.cell.as_any().is::<UserHistoryCell>() {
+            if self.highlighted {
+                user_message_style().reversed()
+            } else {
+                user_message_style()
+            }
+        } else {
+            Style::default()
+        };
+        let p = Paragraph::new(Text::from(visible_lines_ref(&hyperlink_lines)))
+            .style(style)
             .wrap(Wrap { trim: false });
         p.render(area, buf);
         mark_buffer_hyperlinks(buf, area, &hyperlink_lines, /*scroll_rows*/ 0);
@@ -417,14 +425,14 @@ struct HyperlinkLinesRenderable {
 
 impl Renderable for HyperlinkLinesRenderable {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new(Text::from(visible_lines(self.lines.clone())))
+        Paragraph::new(Text::from(visible_lines_ref(&self.lines)))
             .wrap(Wrap { trim: false })
             .render(area, buf);
         mark_buffer_hyperlinks(buf, area, &self.lines, /*scroll_rows*/ 0);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        Paragraph::new(Text::from(visible_lines(self.lines.clone())))
+        Paragraph::new(Text::from(visible_lines_ref(&self.lines)))
             .wrap(Wrap { trim: false })
             .line_count(width)
             .try_into()
@@ -488,40 +496,39 @@ impl TranscriptOverlay {
         cells
             .iter()
             .enumerate()
-            .flat_map(|(i, c)| {
-                let mut v: Vec<Box<dyn Renderable>> = Vec::new();
-                let mut cell_renderable = if c.as_any().is::<UserHistoryCell>() {
-                    Box::new(CachedRenderable::new(CellRenderable {
-                        cell: c.clone(),
-                        style: if highlight_cell == Some(i) {
-                            user_message_style().reversed()
-                        } else {
-                            user_message_style()
-                        },
-                    })) as Box<dyn Renderable>
-                } else {
-                    Box::new(CachedRenderable::new(CellRenderable {
-                        cell: c.clone(),
-                        style: Style::default(),
-                    })) as Box<dyn Renderable>
-                };
-                if !c.is_stream_continuation() && i > 0 {
-                    cell_renderable = Box::new(InsetRenderable::new(
-                        cell_renderable,
-                        Insets::tlbr(
-                            /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
-                        ),
-                    ));
-                }
-                v.push(cell_renderable);
-                v
-            })
+            .map(|(i, cell)| Self::render_cell(cell, i, highlight_cell))
             .collect()
+    }
+
+    /// Build the renderable for a committed cell, caching its height when the cell is stable.
+    fn render_cell(
+        cell: &Arc<dyn HistoryCell>,
+        index: usize,
+        highlight_cell: Option<usize>,
+    ) -> Box<dyn Renderable> {
+        let cell_renderable = CellRenderable {
+            cell: cell.clone(),
+            highlighted: highlight_cell == Some(index),
+        };
+        let mut cell_renderable: Box<dyn Renderable> = if cell.has_stable_transcript_height() {
+            Box::new(CachedRenderable::new(cell_renderable))
+        } else {
+            Box::new(cell_renderable)
+        };
+        if !cell.is_stream_continuation() && index > 0 {
+            cell_renderable = Box::new(InsetRenderable::new(
+                cell_renderable,
+                Insets::tlbr(
+                    /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                ),
+            ));
+        }
+        cell_renderable
     }
 
     /// Insert a committed history cell while keeping any cached live tail.
     ///
-    /// The live tail is temporarily removed, the committed cells are rebuilt,
+    /// The live tail is temporarily removed, the new committed cell is appended,
     /// then the tail is reattached. If the tail previously had no leading
     /// spacing because it was the only renderable, we add the missing inset
     /// when the first committed cell arrives.
@@ -533,8 +540,9 @@ impl TranscriptOverlay {
         let follow_bottom = self.view.is_scrolled_to_bottom();
         let had_prior_cells = !self.cells.is_empty();
         let tail_renderable = self.take_live_tail_renderable();
+        let cell_renderable = Self::render_cell(&cell, self.cells.len(), self.highlight_cell);
         self.cells.push(cell);
-        self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
+        self.view.renderables.push(cell_renderable);
         if let Some(tail) = tail_renderable {
             let tail = if !had_prior_cells
                 && self
@@ -803,11 +811,6 @@ impl TranscriptOverlay {
     pub(crate) fn is_done(&self) -> bool {
         self.is_done
     }
-
-    #[cfg(test)]
-    pub(crate) fn committed_cell_count(&self) -> usize {
-        self.cells.len()
-    }
 }
 
 pub(crate) struct StaticOverlay {
@@ -945,6 +948,8 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use crate::diff_model::FileChange;
@@ -973,6 +978,26 @@ mod tests {
 
         fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
             self.lines.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct HeightCountingCell {
+        height_calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::history_cell::HistoryCell for HeightCountingCell {
+        fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+            vec![Line::from("counted")]
+        }
+
+        fn raw_lines(&self) -> Vec<Line<'static>> {
+            vec![Line::from("counted")]
+        }
+
+        fn desired_transcript_height(&self, _width: u16) -> u16 {
+            self.height_calls.fetch_add(1, Ordering::Relaxed);
+            1
         }
     }
 
@@ -1228,11 +1253,7 @@ mod tests {
         );
         exec_cell.complete_call(
             "exec-1",
-            CommandOutput {
-                exit_code: 0,
-                aggregated_output: "src\nREADME.md\n".into(),
-                formatted_output: "src\nREADME.md\n".into(),
-            },
+            CommandOutput::new(/*exit_code*/ 0, "src\nREADME.md\n".into()),
             Duration::from_millis(420),
         );
         let exec_cell: Arc<dyn HistoryCell> = Arc::new(exec_cell);
@@ -1299,6 +1320,26 @@ mod tests {
         }));
 
         assert_eq!(overlay.view.scroll_offset, 0);
+    }
+
+    #[test]
+    fn transcript_overlay_insert_preserves_cached_cell_heights() {
+        let height_calls = Arc::new(AtomicUsize::new(0));
+        let mut overlay = transcript_overlay(vec![Arc::new(HeightCountingCell {
+            height_calls: height_calls.clone(),
+        })]);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+
+        overlay.render(area, &mut buf);
+        assert_eq!(height_calls.load(Ordering::Relaxed), 1);
+
+        overlay.insert_cell(Arc::new(TestCell {
+            lines: vec![Line::from("inserted")],
+        }));
+        overlay.render(area, &mut buf);
+
+        assert_eq!(height_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

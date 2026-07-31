@@ -16,11 +16,14 @@ use codex_code_mode::CodeModeSession;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::RuntimeResponse;
+use codex_features::Feature;
+use codex_features::Features;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use serde_json::Value as JsonValue;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
+use crate::audio_preparation::estimate_audio_token_count;
 use crate::function_tool::FunctionCallError;
 use crate::original_image_detail::can_request_original_image_detail;
 use crate::original_image_detail::sanitize_original_image_detail as sanitize_image_detail_items;
@@ -51,6 +54,13 @@ pub(crate) use wait_handler::CodeModeWaitHandler;
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
 pub(crate) const DEFAULT_WAIT_YIELD_TIME_MS: u64 = codex_code_mode::DEFAULT_WAIT_YIELD_TIME_MS;
+const BUFFERED_EXEC_YIELD_TIME_MS: u64 = 30_000;
+
+pub(crate) fn default_exec_yield_time_override_ms(features: &Features) -> Option<u64> {
+    features
+        .enabled(Feature::CodeModeBufferedExec)
+        .then_some(BUFFERED_EXEC_YIELD_TIME_MS)
+}
 
 /// Returns true for the un-namespaced code-mode `exec` tool.
 pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
@@ -66,19 +76,49 @@ pub(crate) struct ExecContext {
 pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
+    availability: Result<(), String>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
+    default_exec_yield_time_override_ms: Option<u64>,
     shutting_down: AtomicBool,
+    unavailable_warning_emitted: AtomicBool,
 }
 
 impl CodeModeService {
-    pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
+    pub(crate) fn new(
+        session_provider: Arc<dyn CodeModeSessionProvider>,
+        features: &Features,
+    ) -> Self {
         let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
+        let availability = session_provider.availability();
         Self {
             session: OnceCell::new(),
             session_provider,
+            availability,
             dispatch_broker,
+            default_exec_yield_time_override_ms: default_exec_yield_time_override_ms(features),
             shutting_down: AtomicBool::new(false),
+            unavailable_warning_emitted: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.availability.is_ok()
+    }
+
+    pub(crate) fn take_unavailable_warning(&self, tool_mode: ToolMode) -> Option<String> {
+        let error = self.availability.as_ref().err()?;
+        let behavior = match tool_mode {
+            ToolMode::Direct => "Falling back to direct tools",
+            ToolMode::CodeMode | ToolMode::CodeModeOnly => "Code mode will fail closed",
+        };
+        (!self
+            .unavailable_warning_emitted
+            .swap(true, Ordering::Relaxed))
+        .then(|| {
+            format!(
+                "Code Mode is unavailable because {error}. {behavior}; enable `features.code_mode_host` and install `codex-code-mode-host`."
+            )
+        })
     }
 
     pub(crate) fn session_provider(&self) -> Arc<dyn CodeModeSessionProvider> {
@@ -87,8 +127,11 @@ impl CodeModeService {
 
     pub(crate) async fn execute(
         &self,
-        request: codex_code_mode::ExecuteRequest,
+        mut request: codex_code_mode::ExecuteRequest,
     ) -> Result<codex_code_mode::StartedCell, String> {
+        if request.yield_time_ms.is_none() {
+            request.yield_time_ms = self.default_exec_yield_time_override_ms;
+        }
         self.session().await?.execute(request).await
     }
 
@@ -269,7 +312,7 @@ fn truncate_code_mode_result(
         return truncated_items;
     }
 
-    truncate_function_output_items_with_policy(&items, policy)
+    truncate_function_output_items_with_policy(&items, policy, estimate_audio_token_count)
 }
 
 async fn call_nested_tool(
@@ -300,6 +343,7 @@ async fn call_nested_tool(
         tool_name,
         call_id: format!("{PUBLIC_TOOL_NAME}-{}", uuid::Uuid::new_v4()),
         payload,
+        encrypted_function_args: None,
     };
     let result = tool_runtime
         .handle_tool_call_with_source(
@@ -359,15 +403,10 @@ fn build_freeform_tool_payload(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::CodeModeService;
     use super::build_nested_tool_payload;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
     use codex_code_mode::CodeModeToolKind;
-    use codex_code_mode::ExecuteRequest;
-    use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
     use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_tools::ToolName;
     use serde_json::json;
@@ -425,27 +464,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn missing_process_host_is_reported_without_failing_service_creation() {
-        let service = CodeModeService::new(Arc::new(
-            ProcessOwnedCodeModeSessionProvider::with_host_program(
-                "codex-code-mode-host-does-not-exist".into(),
-            ),
-        ));
+    #[test]
+    fn over_budget_audio_output_is_omitted() {
+        let items = vec![FunctionCallOutputContentItem::InputAudio {
+            audio_url: format!("data:audio/wav;base64,{}", "A".repeat(100)),
+        }];
 
-        let error = service
-            .execute(ExecuteRequest {
-                tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new(),
-                source: "text('unreachable')".to_string(),
-                yield_time_ms: None,
-                max_output_tokens: None,
-            })
-            .await
-            .err()
-            .expect("missing host should reject execution");
-
-        assert!(error.contains("failed to spawn code-mode host"));
-        service.shutdown().await.expect("shutdown unused service");
+        assert_eq!(
+            truncate_code_mode_result(items, Some(5)),
+            vec![FunctionCallOutputContentItem::InputText {
+                text: "[omitted 1 audio items ...]".to_string(),
+            }]
+        );
     }
 }

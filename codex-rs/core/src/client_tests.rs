@@ -19,6 +19,8 @@ use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
 use codex_api::TransportError;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
@@ -102,8 +104,9 @@ fn test_model_client_with_thread_id(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
 }
 
@@ -146,8 +149,9 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
     let prompt = Prompt {
         input: vec![ResponseItem::Message {
@@ -256,7 +260,6 @@ fn test_model_info() -> ModelInfo {
         "upgrade": null,
         "base_instructions": "base instructions",
         "model_messages": null,
-        "supports_reasoning_summaries": false,
         "support_verbosity": false,
         "default_verbosity": null,
         "apply_patch_tool_type": null,
@@ -292,10 +295,7 @@ fn ultra_reasoning_uses_max_for_requests() {
             super::reasoning_effort_for_request(ReasoningEffort::Ultra),
             super::reasoning_effort_for_request(ReasoningEffort::High),
         ),
-        (
-            ReasoningEffort::Custom("max".to_string()),
-            ReasoningEffort::High,
-        )
+        (ReasoningEffort::Max, ReasoningEffort::High,)
     );
 }
 
@@ -328,7 +328,7 @@ async fn chatgpt_auth_manager(
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let auth = auth_manager.auth().await.expect("auth should load");
@@ -412,7 +412,7 @@ fn started_inference_attempt(temp: &TempDir) -> anyhow::Result<InferenceTraceAtt
 
 fn output_message(id: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
-        id: Some(id.to_string()),
+        id: Some(codex_protocol::ResponseItemId::with_suffix("msg", id)),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
@@ -579,7 +579,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
     // response.completed event. The harness has enough information to keep this
     // item in history, so the trace should preserve it when the stream is
     // abandoned.
-    let item = output_message("msg-1", "partial answer");
+    let item = output_message("1", "partial answer");
     let api_stream = futures::stream::iter([Ok(ResponseEvent::OutputItemDone(item))])
         .chain(futures::stream::pending());
     let (mut stream, _) = super::map_response_events(
@@ -697,7 +697,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
         events.push_back(ResponseEvent::Created);
     }
     events.push_back(ResponseEvent::OutputItemDone(output_message(
-        "msg-1",
+        "1",
         "partial answer",
     )));
     let api_stream = NotifyAfterEventStream {
@@ -823,10 +823,11 @@ fn model_client_with_counting_attestation(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
         Some(Arc::new(CountingAttestationProvider {
             calls: attestation_calls.clone(),
         })),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     );
     (model_client, attestation_calls)
 }

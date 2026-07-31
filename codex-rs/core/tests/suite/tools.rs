@@ -27,6 +27,7 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_sandbox;
 use core_test_support::test_codex::local;
@@ -174,6 +175,11 @@ async fn custom_tool_unknown_returns_custom_output_error() -> Result<()> {
         .unwrap_or_default();
     let expected = format!("unsupported custom tool call: {tool_name}");
     assert_eq!(output, expected);
+    assert!(
+        item.pointer("/internal_chat_message_metadata_passthrough/executed_tool_calls")
+            .is_none(),
+        "attempted-tool metadata must be disabled by default",
+    );
 
     Ok(())
 }
@@ -185,6 +191,9 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
 
     let server = start_mock_server().await;
     let mut builder = test_codex();
+    builder = builder.with_config(|config| {
+        let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
+    });
     let test = builder.build(&server).await?;
 
     let call_id = "custom-namespaced";
@@ -226,9 +235,12 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
         .map(str::to_string)
         .expect("custom tool call should include turn metadata");
     assert_eq!(
-        (custom_tool_calls, request.custom_tool_call_output(call_id),),
         (
-            vec![json!({
+            strip_response_item_ids_from_json(Value::Array(custom_tool_calls)),
+            strip_response_item_ids_from_json(request.custom_tool_call_output(call_id)),
+        ),
+        (
+            Value::Array(vec![json!({
                 "type": "custom_tool_call",
                 "call_id": call_id,
                 "namespace": namespace,
@@ -237,16 +249,110 @@ async fn namespaced_custom_tool_call_preserves_namespace_through_dispatch_and_re
                 "internal_chat_message_metadata_passthrough": {
                     "turn_id": turn_id,
                 },
-            })],
+            })]),
             json!({
                 "type": "custom_tool_call_output",
                 "call_id": call_id,
                 "output": format!("unsupported custom tool call: {namespace}{tool_name}"),
                 "internal_chat_message_metadata_passthrough": {
                     "turn_id": turn_id,
+                    "executed_tool_calls": [{
+                        "name": format!("{namespace}__{tool_name}"),
+                        "arguments": input,
+                    }],
                 },
             }),
         )
+    );
+    let escaped_call_id = "custom-namespaced-escaped";
+    let escaped_input = "\\".repeat(4_096);
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-3"),
+            ev_custom_tool_call_with_namespace(
+                escaped_call_id,
+                namespace,
+                tool_name,
+                &escaped_input,
+            ),
+            ev_completed("resp-3"),
+        ]),
+    )
+    .await;
+    let escaped_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-4"),
+        ]),
+    )
+    .await;
+    test.submit_turn_with_approval_and_permission_profile(
+        "invoke namespaced custom tool with escaped arguments",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await?;
+    assert_eq!(
+        escaped_mock
+            .single_request()
+            .custom_tool_call_output(escaped_call_id)["internal_chat_message_metadata_passthrough"]
+            ["executed_tool_calls"],
+        json!([{
+            "name": format!("{namespace}__{tool_name}"),
+            "arguments": {
+                "_codex_executed_tool_call_truncated": {
+                    "original_bytes": serde_json::to_vec(&escaped_input)?.len(),
+                    "max_bytes": 8 * 1024,
+                },
+            },
+        }]),
+    );
+
+    let direct_exec_call_id = "custom-direct-exec";
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-5"),
+            ev_custom_tool_call(
+                direct_exec_call_id,
+                codex_code_mode::PUBLIC_TOOL_NAME,
+                input,
+            ),
+            ev_completed("resp-5"),
+        ]),
+    )
+    .await;
+    let direct_exec_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-3", "done"),
+            ev_completed("resp-6"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn_with_approval_and_permission_profile(
+        "invoke direct custom exec outside code mode",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let direct_exec_output = direct_exec_mock
+        .single_request()
+        .custom_tool_call_output(direct_exec_call_id);
+    assert_eq!(
+        direct_exec_output["output"],
+        json!("unsupported custom tool call: exec"),
+    );
+    assert_eq!(
+        direct_exec_output["internal_chat_message_metadata_passthrough"]["executed_tool_calls"],
+        json!([{
+            "name": codex_code_mode::PUBLIC_TOOL_NAME,
+            "arguments": input,
+        }]),
     );
 
     Ok(())
@@ -453,6 +559,7 @@ async fn shell_command_enforces_glob_deny_read_policy() -> Result<()> {
                         pattern: format!("{}/**/*.env", config.cwd.as_path().display()),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 });
             config
                 .permissions

@@ -1,6 +1,11 @@
 use super::*;
 use crate::app_info::app_info_to_api;
 
+mod installed;
+mod read;
+
+pub(super) use read::APP_READ_MAX_IDS;
+
 pub(crate) struct AppsRequestProcessor {
     auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
@@ -47,6 +52,8 @@ impl AppsRequestProcessor {
         request_id: &ConnectionRequestId,
         params: AppsListParams,
     ) -> Result<Option<AppsListResponse>, JSONRPCErrorError> {
+        let installed_start = Instant::now();
+        let reload = params.force_refetch;
         let thread = if let Some(thread_id) = params.thread_id.as_deref() {
             let (_, loaded_thread) = self.load_thread(thread_id).await?;
             Some(loaded_thread)
@@ -70,20 +77,24 @@ impl AppsRequestProcessor {
             .features
             .apps_enabled_for_auth(auth.as_ref().is_some_and(CodexAuth::uses_codex_backend))
         {
-            return Ok(Some(AppsListResponse {
+            let response = AppsListResponse {
                 data: Vec::new(),
                 next_cursor: None,
-            }));
+            };
+            record_legacy_apps_installed_duration(installed_start, reload);
+            return Ok(Some(response));
         }
 
         if !self
             .workspace_codex_plugins_enabled(&config, auth.as_ref())
             .await
         {
-            return Ok(Some(AppsListResponse {
+            let response = AppsListResponse {
                 data: Vec::new(),
                 next_cursor: None,
-            }));
+            };
+            record_legacy_apps_installed_duration(installed_start, reload);
+            return Ok(Some(response));
         }
 
         let request = request_id.clone();
@@ -103,6 +114,7 @@ impl AppsRequestProcessor {
                     environment_manager,
                     mcp_manager,
                     plugins_manager,
+                    installed_start,
                 ) => {}
             }
         });
@@ -113,6 +125,7 @@ impl AppsRequestProcessor {
         self.shutdown_token.cancel();
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apps_list_task(
         outgoing: Arc<OutgoingMessageSender>,
         request_id: ConnectionRequestId,
@@ -121,7 +134,9 @@ impl AppsRequestProcessor {
         environment_manager: Arc<EnvironmentManager>,
         mcp_manager: Arc<McpManager>,
         plugins_manager: Arc<PluginsManager>,
+        installed_start: Instant,
     ) {
+        let reload = params.force_refetch;
         let retry_params = params.clone();
         let retry_config = config.clone();
         let retry_environment_manager = Arc::clone(&environment_manager);
@@ -136,6 +151,9 @@ impl AppsRequestProcessor {
             plugins_manager,
         )
         .await;
+        if result.is_ok() {
+            record_legacy_apps_installed_duration(installed_start, reload);
+        }
         let should_retry = result
             .as_ref()
             .is_ok_and(|(_, codex_apps_ready)| !codex_apps_ready);
@@ -231,19 +249,23 @@ impl AppsRequestProcessor {
         let mut all_loaded = false;
         let mut codex_apps_ready = true;
         let mut last_notified_apps = None;
+        let mut sent_app_list_update = false;
 
         if accessible_connectors.is_some() || all_connectors.is_some() {
             let merged = connectors::with_app_enabled_state(
                 merge_loaded_apps(all_connectors.as_deref(), accessible_connectors.as_deref()),
                 &config,
             );
-            if should_send_app_list_updated_notification(
+            if !force_refetch {
+                last_notified_apps = Some(merged);
+            } else if should_send_app_list_updated_notification(
                 merged.as_slice(),
                 accessible_loaded,
                 all_loaded,
             ) {
                 send_app_list_updated_notification(outgoing, merged.clone()).await;
                 last_notified_apps = Some(merged);
+                sent_app_list_update = true;
             }
         }
 
@@ -300,10 +322,16 @@ impl AppsRequestProcessor {
                 merged.as_slice(),
                 accessible_loaded,
                 all_loaded,
-            ) && last_notified_apps.as_ref() != Some(&merged)
+            ) && (last_notified_apps.as_ref() != Some(&merged)
+                || (!force_refetch
+                    && start == 0
+                    && accessible_loaded
+                    && all_loaded
+                    && !sent_app_list_update))
             {
                 send_app_list_updated_notification(outgoing, merged.clone()).await;
                 last_notified_apps = Some(merged.clone());
+                sent_app_list_update = true;
             }
 
             if accessible_loaded && all_loaded {
@@ -363,7 +391,20 @@ impl AppsRequestProcessor {
 }
 
 const APP_LIST_LOAD_TIMEOUT: Duration = Duration::from_secs(90);
+// `app/list` is the legacy request-path baseline for the `app/installed` endpoint;
+// `path=legacy` keeps it separate from the new snapshot-backed implementation in dashboards.
+const APPS_INSTALLED_DURATION_METRIC: &str = "codex.apps.installed.duration_ms";
 
+fn record_legacy_apps_installed_duration(started_at: Instant, reload: bool) {
+    let reload = if reload { "true" } else { "false" };
+    if let Some(metrics) = codex_otel::global() {
+        let _ = metrics.record_duration(
+            APPS_INSTALLED_DURATION_METRIC,
+            started_at.elapsed(),
+            &[("path", "legacy"), ("reload", reload)],
+        );
+    }
+}
 enum AppListLoadResult {
     Accessible(Result<AccessibleConnectorsStatus, String>),
     Directory(Result<Vec<AppInfo>, String>),

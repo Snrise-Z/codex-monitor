@@ -12,6 +12,7 @@ use crate::app_server_session::AppServerSession;
 use crate::app_server_session::status_account_display_from_auth_mode;
 use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::AuthMode;
+use codex_app_server_protocol::RateLimitReachedType;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 
@@ -43,11 +44,11 @@ impl App {
                 self.chat_widget.finish_mcp_startup_after_lag();
             }
             AppServerEvent::ServerNotification(notification) => {
-                self.handle_server_notification_event(app_server_client, notification)
+                self.handle_server_notification_event(app_server_client, *notification)
                     .await;
             }
             AppServerEvent::ServerRequest(request) => {
-                self.handle_server_request_event(app_server_client, request)
+                self.handle_server_request_event(app_server_client, *request)
                     .await;
             }
             AppServerEvent::Disconnected { message } => {
@@ -76,6 +77,19 @@ impl App {
                 self.refresh_mcp_startup_expected_servers_from_config();
             }
             ServerNotification::AccountRateLimitsUpdated(notification) => {
+                if matches!(
+                    notification.rate_limits.rate_limit_reached_type,
+                    Some(
+                        RateLimitReachedType::WorkspaceOwnerCreditsDepleted
+                            | RateLimitReachedType::WorkspaceMemberCreditsDepleted
+                            | RateLimitReachedType::WorkspaceOwnerUsageLimitReached
+                            | RateLimitReachedType::WorkspaceMemberUsageLimitReached
+                    )
+                ) || notification.rate_limits.spend_control_reached == Some(true)
+                {
+                    self.rate_limit_hard_stop_generation =
+                        self.rate_limit_hard_stop_generation.wrapping_add(1);
+                }
                 self.chat_widget
                     .on_rolling_rate_limit_snapshot(notification.rate_limits.clone());
                 return;
@@ -118,7 +132,7 @@ impl App {
                 self.fetch_plugins_list(app_server_client, cwd);
                 if should_report_completion {
                     self.chat_widget.add_plain_history_lines(
-                        crate::external_agent_config_migration_flow::external_agent_config_migration_finished_lines(notification),
+                        crate::external_agent_config_migration::flow::external_agent_config_migration_finished_lines(notification),
                     );
                 }
                 return;
@@ -181,6 +195,21 @@ impl App {
         app_server_client: &AppServerSession,
         request: ServerRequest,
     ) {
+        let thread_id = server_request_thread_id(&request);
+        if thread_id.is_some_and(|thread_id| self.abandoned_side_threads.contains(&thread_id)) {
+            if let Err(err) = self
+                .reject_app_server_request(
+                    app_server_client,
+                    request.id().clone(),
+                    "side conversation was closed".to_string(),
+                )
+                .await
+            {
+                tracing::warn!("{err}");
+            }
+            return;
+        }
+
         if let Some(unsupported) = self
             .pending_app_server_requests
             .note_server_request(&request)
@@ -205,7 +234,7 @@ impl App {
             return;
         }
 
-        let Some(thread_id) = server_request_thread_id(&request) else {
+        let Some(thread_id) = thread_id else {
             tracing::warn!("ignoring threadless app-server request");
             return;
         };

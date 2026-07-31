@@ -155,8 +155,7 @@ impl ExecCommandHandler {
         // permissions config below. Consult the configured platform-sandbox requirement before
         // deciding whether parsing may continue without that base path.
         let sandbox = SandboxManager::new().select_initial(
-            &turn.file_system_sandbox_policy(),
-            turn.network_sandbox_policy(),
+            &turn.permission_profile,
             SandboxablePreference::Auto,
             turn.windows_sandbox_level,
             turn.network.is_some(),
@@ -335,6 +334,7 @@ impl ExecCommandHandler {
                 process_id: None,
                 exit_code: None,
                 original_token_count: None,
+                output_omitted_bytes: None,
                 hook_command: None,
             }));
         }
@@ -367,9 +367,15 @@ impl ExecCommandHandler {
             .await
         {
             Ok(response) => Ok(boxed_tool_output(response)),
-            Err(UnifiedExecError::SandboxDenied { output, .. }) => {
+            Err(UnifiedExecError::SandboxDenied {
+                output,
+                original_token_count,
+                output_omitted_bytes,
+                ..
+            }) => {
                 let output_text = output.aggregated_output.text;
-                let original_token_count = approx_token_count(&output_text);
+                let original_token_count =
+                    original_token_count.unwrap_or_else(|| approx_token_count(&output_text));
                 Ok(boxed_tool_output(ExecCommandToolOutput {
                     event_call_id: context.call_id.clone(),
                     chunk_id: generate_chunk_id(),
@@ -382,6 +388,7 @@ impl ExecCommandHandler {
                     process_id: None,
                     exit_code: Some(output.exit_code),
                     original_token_count: Some(original_token_count),
+                    output_omitted_bytes,
                     hook_command: Some(hook_command),
                 }))
             }

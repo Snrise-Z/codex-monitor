@@ -1,3 +1,6 @@
+use codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY;
+use codex_network_proxy::write_attribution_frame;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -10,6 +13,7 @@ use std::io::Read;
 use std::io::Write;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::net::Shutdown;
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -27,6 +31,8 @@ use url::Url;
 const PROXY_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "WS_PROXY",
+    "WSS_PROXY",
     "ALL_PROXY",
     "FTP_PROXY",
     "YARN_HTTP_PROXY",
@@ -70,9 +76,13 @@ struct ProxyRoutePlan {
     has_proxy_config: bool,
 }
 
-pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<String> {
-    let env: HashMap<String, String> = std::env::vars().collect();
-    let plan = plan_proxy_routes(&env);
+pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<(String, AbsolutePathBuf)> {
+    let (attribution_token, plan) = extract_attribution_token_and_plan(std::env::vars().collect());
+    // SAFETY: the sandbox helper is single-threaded here, before it forks bridge workers or
+    // executes the user command.
+    unsafe {
+        std::env::remove_var(PROXY_ATTRIBUTION_TOKEN_ENV_KEY);
+    }
 
     if plan.routes.is_empty() {
         let message = if plan.has_proxy_config {
@@ -87,6 +97,7 @@ pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<String> {
     let _ = cleanup_stale_proxy_socket_dirs_in(socket_parent_dir.as_path());
 
     let socket_dir = create_proxy_socket_dir()?;
+    let readable_socket_dir = AbsolutePathBuf::relative_to_current_dir(&socket_dir)?;
     let mut socket_by_endpoint: BTreeMap<SocketAddr, PathBuf> = BTreeMap::new();
     let mut next_index = 0usize;
     for route in &plan.routes {
@@ -100,7 +111,11 @@ pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<String> {
 
     let mut host_bridge_pids = Vec::with_capacity(socket_by_endpoint.len());
     for (endpoint, socket_path) in &socket_by_endpoint {
-        host_bridge_pids.push(spawn_host_bridge(*endpoint, socket_path)?);
+        host_bridge_pids.push(spawn_host_bridge(
+            *endpoint,
+            socket_path,
+            attribution_token.as_deref(),
+        )?);
     }
     spawn_proxy_socket_dir_cleanup_worker(socket_dir, host_bridge_pids)?;
 
@@ -118,7 +133,16 @@ pub(crate) fn prepare_host_proxy_route_spec() -> io::Result<String> {
         });
     }
 
-    serde_json::to_string(&ProxyRouteSpec { routes }).map_err(io::Error::other)
+    let spec = serde_json::to_string(&ProxyRouteSpec { routes }).map_err(io::Error::other)?;
+    Ok((spec, readable_socket_dir))
+}
+
+fn extract_attribution_token_and_plan(
+    mut env: HashMap<String, String>,
+) -> (Option<String>, ProxyRoutePlan) {
+    let attribution_token = env.remove(PROXY_ATTRIBUTION_TOKEN_ENV_KEY);
+    let plan = plan_proxy_routes(&env);
+    (attribution_token, plan)
 }
 
 pub(crate) fn activate_proxy_routes_in_netns(serialized_spec: &str) -> io::Result<()> {
@@ -438,7 +462,11 @@ fn cleanup_proxy_socket_dir(socket_dir: &Path) -> io::Result<()> {
     }
 }
 
-fn spawn_host_bridge(endpoint: SocketAddr, uds_path: &Path) -> io::Result<libc::pid_t> {
+fn spawn_host_bridge(
+    endpoint: SocketAddr,
+    uds_path: &Path,
+    attribution_token: Option<&str>,
+) -> io::Result<libc::pid_t> {
     let (read_fd, write_fd) = create_ready_pipe()?;
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -452,7 +480,7 @@ fn spawn_host_bridge(endpoint: SocketAddr, uds_path: &Path) -> io::Result<libc::
         if close_fd(read_fd).is_err() {
             unsafe { libc::_exit(1) };
         }
-        let result = run_host_bridge(endpoint, uds_path, write_fd);
+        let result = run_host_bridge(endpoint, uds_path, write_fd, attribution_token);
         if result.is_err() {
             unsafe { libc::_exit(1) };
         }
@@ -471,7 +499,12 @@ fn spawn_host_bridge(endpoint: SocketAddr, uds_path: &Path) -> io::Result<libc::
     Ok(pid)
 }
 
-fn run_host_bridge(endpoint: SocketAddr, uds_path: &Path, ready_fd: libc::c_int) -> io::Result<()> {
+fn run_host_bridge(
+    endpoint: SocketAddr,
+    uds_path: &Path,
+    ready_fd: libc::c_int,
+    attribution_token: Option<&str>,
+) -> io::Result<()> {
     harden_bridge_process()?;
     if uds_path.exists() {
         std::fs::remove_file(uds_path)?;
@@ -482,13 +515,22 @@ fn run_host_bridge(endpoint: SocketAddr, uds_path: &Path, ready_fd: libc::c_int)
     ready_file.write_all(&[HOST_BRIDGE_READY])?;
     drop(ready_file);
 
+    let attribution_token = attribution_token.map(str::to_owned);
     loop {
         let (unix_stream, _) = listener.accept()?;
+        let attribution_token = attribution_token.clone();
         std::thread::spawn(move || {
-            let tcp_stream = match TcpStream::connect(endpoint) {
+            let mut tcp_stream = match TcpStream::connect(endpoint) {
                 Ok(stream) => stream,
                 Err(_) => return,
             };
+            if let Some(attribution_token) = attribution_token
+                && write_attribution_frame(&mut tcp_stream, &attribution_token).is_err()
+            {
+                // The shared ingress must reject unauthenticated connections; do not forward
+                // application bytes if this bridge cannot prove the exec attribution first.
+                return;
+            }
             let _ = proxy_bidirectional(tcp_stream, unix_stream);
         });
     }
@@ -644,8 +686,13 @@ fn harden_bridge_process() -> io::Result<()> {
 fn proxy_bidirectional(mut tcp_stream: TcpStream, mut unix_stream: UnixStream) -> io::Result<()> {
     let mut tcp_reader = tcp_stream.try_clone()?;
     let mut unix_writer = unix_stream.try_clone()?;
-    let tcp_to_unix = std::thread::spawn(move || std::io::copy(&mut tcp_reader, &mut unix_writer));
+    let tcp_to_unix = std::thread::spawn(move || {
+        let result = std::io::copy(&mut tcp_reader, &mut unix_writer);
+        let _ = unix_writer.shutdown(Shutdown::Write);
+        result
+    });
     let unix_to_tcp = std::io::copy(&mut unix_stream, &mut tcp_stream);
+    let _ = tcp_stream.shutdown(Shutdown::Write);
     let tcp_to_unix = tcp_to_unix
         .join()
         .map_err(|_| io::Error::other("bridge thread panicked"))?;
@@ -673,12 +720,14 @@ fn close_fd(fd: libc::c_int) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::PROXY_ATTRIBUTION_TOKEN_ENV_KEY;
     use super::PROXY_SOCKET_DIR_PREFIX;
     use super::ProxyRouteEntry;
     use super::ProxyRouteSpec;
     use super::cleanup_proxy_socket_dir;
     use super::cleanup_stale_proxy_socket_dirs_in;
     use super::default_proxy_port;
+    use super::extract_attribution_token_and_plan;
     use super::is_proxy_env_key;
     use super::parse_loopback_proxy_endpoint;
     use super::parse_proxy_socket_dir_owner_pid;
@@ -694,6 +743,8 @@ mod tests {
     fn recognizes_proxy_env_keys_case_insensitively() {
         assert_eq!(is_proxy_env_key("HTTP_PROXY"), true);
         assert_eq!(is_proxy_env_key("http_proxy"), true);
+        assert_eq!(is_proxy_env_key("WS_PROXY"), true);
+        assert_eq!(is_proxy_env_key("wss_proxy"), true);
         assert_eq!(is_proxy_env_key("PATH"), false);
     }
 
@@ -740,6 +791,35 @@ mod tests {
             "127.0.0.1:43128"
                 .parse::<SocketAddr>()
                 .expect("valid socket")
+        );
+    }
+
+    #[test]
+    fn attribution_token_is_extracted_before_proxy_route_planning() {
+        let mut env = HashMap::new();
+        env.insert(
+            "HTTP_PROXY".to_string(),
+            "http://127.0.0.1:43128".to_string(),
+        );
+        env.insert(
+            PROXY_ATTRIBUTION_TOKEN_ENV_KEY.to_string(),
+            "exec-token".to_string(),
+        );
+
+        let (attribution_token, plan) = extract_attribution_token_and_plan(env);
+
+        assert_eq!(attribution_token.as_deref(), Some("exec-token"));
+        assert_eq!(
+            plan,
+            super::ProxyRoutePlan {
+                routes: vec![super::PlannedProxyRoute {
+                    env_key: "HTTP_PROXY".to_string(),
+                    endpoint: "127.0.0.1:43128"
+                        .parse::<SocketAddr>()
+                        .expect("valid socket"),
+                }],
+                has_proxy_config: true,
+            }
         );
     }
 

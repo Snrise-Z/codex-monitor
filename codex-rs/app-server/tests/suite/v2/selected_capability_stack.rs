@@ -28,6 +28,7 @@ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::process::wait_for_pid_file;
@@ -139,7 +140,12 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
     )
     .await;
 
-    let mut app_server = TestAppServer::new(fixture.codex_home.path()).await?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(fixture.codex_home.path())
+        // This fixture owns environments.toml and selects its environments explicitly.
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(READ_TIMEOUT, app_server.initialize()).await??;
     let thread_id = start_thread(
         &mut app_server,
@@ -185,7 +191,12 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
     drop(app_server);
     std::fs::remove_file(&fixture.pid_file)?;
 
-    let mut app_server = TestAppServer::new(fixture.codex_home.path()).await?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(fixture.codex_home.path())
+        // This fixture owns environments.toml and selects its environments explicitly.
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(READ_TIMEOUT, app_server.initialize()).await??;
     let request_id = app_server
         .send_thread_resume_request(ThreadResumeParams {
@@ -235,7 +246,9 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
     for request in &requests[1..4] {
         assert_selected_skill_is_injected(request, /*expected_count*/ 1);
         assert_selected_plugin_tools(request);
+        assert_plugin_guidance_count(request, /*expected_count*/ 1);
     }
+    assert_plugin_guidance_count(&requests[4], /*expected_count*/ 1);
     assert_selected_skill_is_injected(&requests[5], /*expected_count*/ 2);
     assert_selected_plugin_tools(&requests[5]);
     let output = requests[2].function_call_output(MCP_CALL_ID);
@@ -330,7 +343,12 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn() ->
     )
     .await;
 
-    let mut app_server = TestAppServer::new(fixture.codex_home.path()).await?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(fixture.codex_home.path())
+        // This fixture owns environments.toml and selects its environments explicitly.
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(READ_TIMEOUT, app_server.initialize()).await??;
     let thread_id = start_thread(
         &mut app_server,
@@ -348,6 +366,7 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn() ->
             environments: Some(vec![TurnEnvironmentParams {
                 environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                 cwd: fixture.environment_cwd.into(),
+                runtime_workspace_roots: None,
             }]),
             collaboration_mode: Some(CollaborationMode {
                 mode: ModeKind::Plan,
@@ -398,7 +417,9 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn() ->
     assert_eq!(3, requests.len());
     assert_selected_skill_catalog_available(&requests[1]);
     assert_selected_plugin_tools(&requests[1]);
+    assert_plugin_guidance_count(&requests[1], /*expected_count*/ 1);
     assert_selected_plugin_tools(&requests[2]);
+    assert_plugin_guidance_count(&requests[2], /*expected_count*/ 1);
     let output = requests[2].function_call_output(MCP_CALL_ID);
     let output = output["output"]
         .as_str()
@@ -441,7 +462,7 @@ fn selected_capability_fixture(
     std::fs::write(
         config_path,
         format!(
-            "{config}\n[features]\napps = true\ndeferred_executor = true\n\n[skills]\ninclude_instructions = true\n"
+            "{config}\n[features]\napps = true\ndeferred_executor = true\nexecutor_capability_discovery = true\n\n[skills]\ninclude_instructions = true\n"
         ),
     )?;
     write_chatgpt_auth(
@@ -537,6 +558,7 @@ fn assert_selected_capabilities_absent(request: &ResponsesRequest) {
             .all(|text| !text.contains(SKILL_DESCRIPTION))
     );
     assert_selected_plugin_tools_absent(request);
+    assert_plugin_guidance_count(request, /*expected_count*/ 0);
 }
 
 fn assert_selected_plugin_tools_absent(request: &ResponsesRequest) {
@@ -552,6 +574,17 @@ fn assert_selected_plugin_tools_absent(request: &ResponsesRequest) {
         connector["description"]
             .as_str()
             .is_some_and(|description| !description.contains(PLUGIN_DISPLAY_NAME))
+    );
+}
+
+fn assert_plugin_guidance_count(request: &ResponsesRequest, expected_count: usize) {
+    assert_eq!(
+        expected_count,
+        request
+            .message_input_texts("developer")
+            .into_iter()
+            .filter(|text| text.starts_with(PLUGINS_INSTRUCTIONS_OPEN_TAG))
+            .count()
     );
 }
 
@@ -612,6 +645,7 @@ async fn start_thread(
             environments: Some(vec![TurnEnvironmentParams {
                 environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                 cwd: environment_cwd.into(),
+                runtime_workspace_roots: None,
             }]),
             selected_capability_roots: Some(vec![selected_root]),
             ..Default::default()
@@ -642,6 +676,7 @@ async fn run_turn(
             environments: Some(vec![TurnEnvironmentParams {
                 environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
                 cwd: environment_cwd.into(),
+                runtime_workspace_roots: None,
             }]),
             ..Default::default()
         })

@@ -3,6 +3,7 @@ use codex_api::ModelsClient;
 use codex_api::Provider;
 use codex_api::RetryConfig;
 use codex_client::ReqwestTransport;
+use codex_http_client::HttpClientBuilder;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
@@ -80,7 +81,8 @@ async fn models_client_hits_models_endpoint() {
             upgrade: None,
             base_instructions: "base instructions".to_string(),
             model_messages: None,
-            supports_reasoning_summaries: false,
+            include_skills_usage_instructions: false,
+            supports_reasoning_summary_parameter: true,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,
             default_verbosity: None,
@@ -116,11 +118,17 @@ async fn models_client_hits_models_endpoint() {
         .mount(&server)
         .await;
 
-    let transport = ReqwestTransport::new(reqwest::Client::new());
-    let client = ModelsClient::new(transport, provider(&base_url), Arc::new(DummyAuth));
+    let transport = ReqwestTransport::from_http_client(
+        HttpClientBuilder::new()
+            .build_direct()
+            .expect("test HTTP client should build"),
+    );
+    let provider = provider(&base_url);
+    let request_url = ModelsClient::<ReqwestTransport>::request_url(&provider, "0.1.0");
+    let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
     let (models, _) = client
-        .list_models("0.1.0", HeaderMap::new())
+        .list_models(request_url, HeaderMap::new())
         .await
         .expect("models request should succeed");
 

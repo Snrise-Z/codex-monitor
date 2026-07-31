@@ -33,6 +33,8 @@ fn skills_to_info(
                         short_description: interface.short_description,
                         icon_small: interface.icon_small,
                         icon_large: interface.icon_large,
+                        icon_small_url: None,
+                        icon_large_url: None,
                         brand_color: interface.brand_color,
                         default_prompt: interface.default_prompt,
                     }
@@ -72,6 +74,7 @@ fn hooks_to_info(hooks: &[codex_hooks::HookListEntry]) -> Vec<HookMetadata> {
             command: hook.command.clone(),
             timeout_sec: hook.timeout_sec,
             status_message: hook.status_message.clone(),
+            additional_context_limit: hook.additional_context_limit,
             source_path: hook.source_path.clone(),
             source: hook.source.into(),
             plugin_id: hook.plugin_id.clone(),
@@ -157,9 +160,13 @@ impl CatalogRequestProcessor {
         &self,
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Self::list_models(self.thread_manager.clone(), params)
-            .await
-            .map(|response| Some(response.into()))
+        Self::list_models(
+            self.thread_manager.clone(),
+            self.config.http_client_factory(),
+            params,
+        )
+        .await
+        .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn experimental_feature_list(
@@ -247,6 +254,7 @@ impl CatalogRequestProcessor {
 
     async fn list_models(
         thread_manager: Arc<ThreadManager>,
+        http_client_factory: codex_http_client::HttpClientFactory,
         params: ModelListParams,
     ) -> Result<ModelListResponse, JSONRPCErrorError> {
         let ModelListParams {
@@ -254,7 +262,12 @@ impl CatalogRequestProcessor {
             cursor,
             include_hidden,
         } = params;
-        let models = supported_models(thread_manager, include_hidden.unwrap_or(false)).await;
+        let models = supported_models(
+            thread_manager,
+            include_hidden.unwrap_or(false),
+            http_client_factory,
+        )
+        .await;
         let total = models.len();
 
         if total == 0 {

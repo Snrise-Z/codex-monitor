@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,100 +17,187 @@ use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::SessionId;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_install_context::InstallContext;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 
 use self::connection::Connection;
+use self::connection::ConnectionError;
 use self::connection::RemoteSession;
 use self::connection::SessionCleanup;
 use crate::NoopCodeModeSessionDelegate;
 
 mod connection;
 
-const CODE_MODE_HOST_PATH_ENV: &str = "CODEX_CODE_MODE_HOST_PATH";
-
 type ShutdownResultReceiver = watch::Receiver<Option<Result<(), String>>>;
 
 /// Creates code-mode sessions backed by one lazily spawned process host.
 pub struct ProcessOwnedCodeModeSessionProvider {
-    host_program: PathBuf,
-    process_host: StdMutex<Option<Arc<OwnedProcessHost>>>,
+    host: Arc<OwnedCodeModeHost>,
+}
+
+/// Rejects code-mode sessions when the standalone host is disabled.
+#[derive(Default)]
+pub struct DisabledCodeModeSessionProvider;
+
+/// Creates code-mode sessions backed by one shared remote WebSocket connection.
+pub struct WebSocketCodeModeSessionProvider {
+    host: Arc<OwnedCodeModeHost>,
 }
 
 impl ProcessOwnedCodeModeSessionProvider {
     pub fn with_host_program(host_program: PathBuf) -> Self {
         Self {
-            host_program,
-            process_host: StdMutex::new(None),
+            host: Arc::new(OwnedCodeModeHost::new(host_program)),
         }
     }
 
-    fn process_host(&self) -> Arc<OwnedProcessHost> {
-        let mut process_host = self
-            .process_host
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(process_host) = process_host.as_ref() {
-            return Arc::clone(process_host);
-        }
-
-        let new_process_host = Arc::new(OwnedProcessHost::new(self.host_program.clone()));
-        *process_host = Some(Arc::clone(&new_process_host));
-        new_process_host
+    fn process_host(&self) -> Arc<OwnedCodeModeHost> {
+        Arc::clone(&self.host)
     }
 }
 
 impl Default for ProcessOwnedCodeModeSessionProvider {
     fn default() -> Self {
-        Self::with_host_program(default_host_program())
+        Self::with_host_program(InstallContext::current().code_mode_host_program())
     }
 }
 
 impl CodeModeSessionProvider for ProcessOwnedCodeModeSessionProvider {
+    fn availability(&self) -> Result<(), String> {
+        let HostEndpoint::Process(host_program) = &self.host.endpoint else {
+            unreachable!("a process-owned provider always has a process endpoint");
+        };
+        if host_program.is_file() {
+            Ok(())
+        } else {
+            Err(ConnectionError::Spawn {
+                host_program: host_program.clone(),
+                error: io::Error::new(io::ErrorKind::NotFound, "host executable was not found"),
+            }
+            .to_string())
+        }
+    }
+
     fn create_session<'a>(
         &'a self,
         delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> CodeModeSessionProviderFuture<'a> {
-        let session = ProcessOwnedCodeModeSession::with_process_host(delegate, self.process_host());
-        Box::pin(async move {
-            session.connection().await?;
-            let session: Arc<dyn CodeModeSession> = Arc::new(session);
-            Ok(session)
-        })
+        Box::pin(create_host_session(delegate, self.process_host()))
     }
 }
 
-struct OwnedProcessHost {
-    host_program: PathBuf,
+impl CodeModeSessionProvider for DisabledCodeModeSessionProvider {
+    fn availability(&self) -> Result<(), String> {
+        Err("code-mode host is disabled".to_string())
+    }
+
+    fn create_session<'a>(
+        &'a self,
+        _delegate: Arc<dyn CodeModeSessionDelegate>,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        Box::pin(async { Err("code-mode host is disabled".to_string()) })
+    }
+}
+
+impl WebSocketCodeModeSessionProvider {
+    pub fn new(websocket_url: String) -> Self {
+        Self::with_http_client_factory(
+            websocket_url,
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+    }
+
+    /// Creates a remote host using the application's effective proxy and TLS policy.
+    pub fn with_http_client_factory(
+        websocket_url: String,
+        http_client_factory: HttpClientFactory,
+    ) -> Self {
+        Self {
+            host: Arc::new(OwnedCodeModeHost::websocket(
+                websocket_url,
+                http_client_factory,
+            )),
+        }
+    }
+}
+
+impl CodeModeSessionProvider for WebSocketCodeModeSessionProvider {
+    fn create_session<'a>(
+        &'a self,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        Box::pin(create_host_session(delegate, Arc::clone(&self.host)))
+    }
+}
+
+async fn create_host_session(
+    delegate: Arc<dyn CodeModeSessionDelegate>,
+    host: Arc<OwnedCodeModeHost>,
+) -> Result<Arc<dyn CodeModeSession>, String> {
+    let session = ProcessOwnedCodeModeSession::with_host(delegate, host);
+    session.connection().await?;
+    Ok(Arc::new(session))
+}
+
+enum HostEndpoint {
+    Process(PathBuf),
+    WebSocket {
+        websocket_url: String,
+        http_client_factory: HttpClientFactory,
+    },
+}
+
+struct OwnedCodeModeHost {
+    endpoint: HostEndpoint,
     connection: StdMutex<Option<Arc<Connection>>>,
-    spawn_permit: Semaphore,
+    connect_permit: Semaphore,
     next_session_id: AtomicU64,
 }
 
-impl OwnedProcessHost {
+impl OwnedCodeModeHost {
     fn new(host_program: PathBuf) -> Self {
         Self {
-            host_program,
+            endpoint: HostEndpoint::Process(host_program),
             connection: StdMutex::new(None),
-            spawn_permit: Semaphore::new(/*permits*/ 1),
+            connect_permit: Semaphore::new(/*permits*/ 1),
             next_session_id: AtomicU64::new(1),
         }
     }
 
-    async fn connection(&self) -> Result<Arc<Connection>, String> {
+    fn websocket(websocket_url: String, http_client_factory: HttpClientFactory) -> Self {
+        Self {
+            endpoint: HostEndpoint::WebSocket {
+                websocket_url,
+                http_client_factory,
+            },
+            connection: StdMutex::new(None),
+            connect_permit: Semaphore::new(/*permits*/ 1),
+            next_session_id: AtomicU64::new(1),
+        }
+    }
+
+    async fn connection(&self) -> Result<Arc<Connection>, ConnectionError> {
         if let Some(connection) = self.live_connection() {
             return Ok(connection);
         }
 
-        let _spawn_permit = self
-            .spawn_permit
-            .acquire()
-            .await
-            .map_err(|_| "code-mode host spawn coordinator closed".to_string())?;
+        let _connect_permit = self.connect_permit.acquire().await.map_err(|_| {
+            ConnectionError::Other("code-mode host connection coordinator closed".into())
+        })?;
         if let Some(connection) = self.live_connection() {
             return Ok(connection);
         }
-        let new_connection = Arc::new(Connection::spawn(&self.host_program).await?);
+        let new_connection = match &self.endpoint {
+            HostEndpoint::Process(host_program) => Connection::spawn(host_program).await?,
+            HostEndpoint::WebSocket {
+                websocket_url,
+                http_client_factory,
+            } => Connection::connect_websocket(websocket_url, http_client_factory).await?,
+        };
+        let new_connection = Arc::new(new_connection);
         *self
             .connection
             .lock()
@@ -156,7 +242,7 @@ struct SessionBinding {
 }
 
 struct SessionInner {
-    process_host: Arc<OwnedProcessHost>,
+    host: Arc<OwnedCodeModeHost>,
     delegate: Arc<dyn CodeModeSessionDelegate>,
     state: StdMutex<SessionState>,
     next_generation: AtomicU64,
@@ -165,26 +251,25 @@ struct SessionInner {
     retired_cleanups: StdMutex<Vec<SessionCleanup>>,
 }
 
-/// A logical code-mode session assigned to a process-owned host.
+/// A logical code-mode session assigned to a process or WebSocket host.
 pub struct ProcessOwnedCodeModeSession {
     inner: Arc<SessionInner>,
 }
 
 impl ProcessOwnedCodeModeSession {
     pub fn new() -> Self {
-        Self::with_process_host(
+        Self::with_host(
             Arc::new(NoopCodeModeSessionDelegate),
-            Arc::new(OwnedProcessHost::new(default_host_program())),
+            Arc::new(OwnedCodeModeHost::new(
+                InstallContext::current().code_mode_host_program(),
+            )),
         )
     }
 
-    fn with_process_host(
-        delegate: Arc<dyn CodeModeSessionDelegate>,
-        process_host: Arc<OwnedProcessHost>,
-    ) -> Self {
+    fn with_host(delegate: Arc<dyn CodeModeSessionDelegate>, host: Arc<OwnedCodeModeHost>) -> Self {
         Self {
             inner: Arc::new(SessionInner {
-                process_host,
+                host,
                 delegate,
                 state: StdMutex::new(SessionState::New),
                 next_generation: AtomicU64::new(1),
@@ -234,7 +319,7 @@ impl SessionInner {
                     SessionState::New => {
                         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                         let remote = RemoteSession {
-                            id: self.process_host.allocate_session_id(),
+                            id: self.host.allocate_session_id(),
                             generation,
                         };
                         let (result_tx, result_rx) = watch::channel(None);
@@ -273,7 +358,7 @@ impl SessionInner {
         remote: RemoteSession,
         result_tx: watch::Sender<Option<Result<SessionBinding, String>>>,
     ) {
-        let result = match self.process_host.connection().await {
+        let result = match self.host.connection().await {
             Ok(connection) => {
                 let cleanup = connection
                     .open_session(remote.clone(), Arc::clone(&self.delegate))
@@ -284,7 +369,7 @@ impl SessionInner {
                     cleanup,
                 })
             }
-            Err(err) => Err(err),
+            Err(err) => Err(err.to_string()),
         };
         {
             let mut state = self
@@ -471,33 +556,6 @@ impl CodeModeSession for ProcessOwnedCodeModeSession {
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
         Box::pin(ProcessOwnedCodeModeSession::shutdown(self))
     }
-}
-
-fn default_host_program() -> PathBuf {
-    resolve_host_program(
-        std::env::var_os(CODE_MODE_HOST_PATH_ENV),
-        std::env::current_exe(),
-    )
-}
-
-fn resolve_host_program(
-    override_path: Option<OsString>,
-    current_exe: io::Result<PathBuf>,
-) -> PathBuf {
-    if let Some(path) = override_path {
-        return PathBuf::from(path);
-    }
-    let executable_name = if cfg!(windows) {
-        "codex-code-mode-host.exe"
-    } else {
-        "codex-code-mode-host"
-    };
-    if let Ok(current_exe) = current_exe
-        && let Some(parent) = current_exe.parent()
-    {
-        return parent.join(executable_name);
-    }
-    PathBuf::from(executable_name)
 }
 
 #[cfg(test)]

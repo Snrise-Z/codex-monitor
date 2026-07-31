@@ -1,5 +1,7 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
+use crate::agent::role::apply_role_to_config_for_multi_agent_v2;
+use crate::config::PermissionProfileSnapshot;
 use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
@@ -7,6 +9,17 @@ const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 struct SpawnAgentThreadInheritance {
     environments: Option<TurnEnvironmentSnapshot>,
     exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
+}
+
+/// Initial input delivered after a spawned agent acquires execution capacity.
+///
+/// V2 communication spawns keep the communication and its context paired so centralized
+/// submission and lifecycle logging cannot receive one without the other. Other spawn sources
+/// provide user input directly, making an uncontextualized inter-agent communication
+/// unrepresentable.
+enum SpawnInitialInput {
+    UserInput(Vec<UserInput>),
+    InterAgentCommunication(InterAgentCommunication, AgentCommunicationContext),
 }
 
 fn default_agent_nickname_list() -> Vec<&'static str> {
@@ -83,18 +96,116 @@ fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &
         .any(|usage_hint_text| usage_hint_text == text)
 }
 
+async fn load_agent_model_context(
+    state: &ThreadManagerState,
+    thread_id: ThreadId,
+    history_mode: ThreadHistoryMode,
+) -> CodexResult<Option<Vec<RolloutItem>>> {
+    match history_mode {
+        ThreadHistoryMode::Legacy => Ok(state
+            .read_stored_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: true,
+            })
+            .await?
+            .history
+            .map(|history| history.items)),
+        ThreadHistoryMode::Paginated => Ok(Some(
+            state
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived: true,
+                })
+                .await?
+                .items,
+        )),
+    }
+}
+
 impl AgentControl {
+    /// Restore persisted V2 agent identities without reopening their runtimes.
+    pub(crate) async fn restore_v2_agent_metadata(
+        &self,
+        config: &Config,
+        root_thread_id: ThreadId,
+    ) {
+        self.state.register_root_thread(root_thread_id);
+
+        let Ok(state) = self.upgrade() else {
+            return;
+        };
+        let Some(agent_graph_store) = state.agent_graph_store() else {
+            return;
+        };
+        let descendant_ids = match agent_graph_store
+            .list_thread_spawn_descendants(
+                root_thread_id,
+                Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
+            )
+            .await
+        {
+            Ok(descendant_ids) => descendant_ids,
+            Err(err) => {
+                warn!("failed to restore persisted V2 agent metadata for {root_thread_id}: {err}");
+                return;
+            }
+        };
+
+        for thread_id in descendant_ids {
+            if self.state.agent_metadata_for_thread(thread_id).is_some() {
+                continue;
+            }
+            let restore_result = async {
+                let stored_thread = state
+                    .read_stored_thread(ReadThreadParams {
+                        thread_id,
+                        include_archived: true,
+                        include_history: false,
+                    })
+                    .await?;
+                let stored_agent_path = stored_thread
+                    .agent_path
+                    .as_deref()
+                    .map(AgentPath::try_from)
+                    .transpose()
+                    .map_err(|err| {
+                        CodexErr::InvalidRequest(format!("invalid stored agent path: {err}"))
+                    })?;
+                let mut reservation = self.state.reserve_spawn_slot(/*max_threads*/ None)?;
+                let mut metadata = self.prepare_agent_metadata(
+                    &mut reservation,
+                    config,
+                    stored_agent_path.or_else(|| stored_thread.source.get_agent_path()),
+                    stored_thread
+                        .agent_role
+                        .or_else(|| stored_thread.source.get_agent_role()),
+                    stored_thread
+                        .agent_nickname
+                        .or_else(|| stored_thread.source.get_nickname()),
+                )?;
+                metadata.agent_id = Some(thread_id);
+                reservation.commit(metadata);
+                Ok::<(), CodexErr>(())
+            }
+            .await;
+            if let Err(err) = restore_result {
+                warn!("failed to restore V2 agent metadata for {thread_id}: {err}");
+            }
+        }
+    }
+
     /// Spawn a new agent thread and submit the initial prompt.
     #[cfg(test)]
     pub(crate) async fn spawn_agent(
         &self,
         config: Config,
-        initial_operation: Op,
+        initial_input: Vec<UserInput>,
         session_source: Option<SessionSource>,
     ) -> CodexResult<ThreadId> {
         let spawned_agent = Box::pin(self.spawn_agent_internal(
             config,
-            initial_operation,
+            SpawnInitialInput::UserInput(initial_input),
             session_source,
             SpawnAgentOptions::default(),
         ))
@@ -106,17 +217,39 @@ impl AgentControl {
     pub(crate) async fn spawn_agent_with_metadata(
         &self,
         config: Config,
-        initial_operation: Op,
+        initial_input: Vec<UserInput>,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions, // TODO(jif) drop with new fork.
     ) -> CodexResult<LiveAgent> {
-        Box::pin(self.spawn_agent_internal(config, initial_operation, session_source, options))
-            .await
+        Box::pin(self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::UserInput(initial_input),
+            session_source,
+            options,
+        ))
+        .await
+    }
+
+    pub(crate) async fn spawn_agent_with_communication(
+        &self,
+        config: Config,
+        communication: InterAgentCommunication,
+        context: AgentCommunicationContext,
+        session_source: Option<SessionSource>,
+        options: SpawnAgentOptions,
+    ) -> CodexResult<LiveAgent> {
+        Box::pin(self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::InterAgentCommunication(communication, context),
+            session_source,
+            options,
+        ))
+        .await
     }
 
     pub(crate) async fn ensure_v2_agent_loaded(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
     ) -> CodexResult<()> {
         let state = self.upgrade()?;
@@ -132,15 +265,14 @@ impl AgentControl {
             .read_stored_thread(ReadThreadParams {
                 thread_id,
                 include_archived: true,
-                include_history: true,
+                include_history: false,
             })
             .await?;
         let stored_source = stored_thread.source.clone();
         let stored_parent_thread_id = stored_thread.parent_thread_id;
-        let history = stored_thread
-            .history
-            .ok_or(CodexErr::ThreadNotFound(thread_id))?
-            .items;
+        let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
+            .await?
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
         let initial_history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: thread_id,
             history: Arc::new(history),
@@ -149,13 +281,49 @@ impl AgentControl {
         if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
+        let (session_source, _) = initial_history
+            .get_resumed_session_sources()
+            .unwrap_or((stored_source, None));
+        if let Some(role_name) = session_source.get_agent_role() {
+            let runtime_approval_policy = config.permissions.approval_policy.value();
+            let runtime_approvals_reviewer = config.approvals_reviewer;
+            let runtime_cwd = config.cwd.clone();
+            let runtime_permission_profile = match config.permissions.active_permission_profile() {
+                Some(active_permission_profile) => {
+                    PermissionProfileSnapshot::active_with_profile_workspace_roots(
+                        config.permissions.permission_profile().clone(),
+                        active_permission_profile,
+                        config.permissions.profile_workspace_roots().to_vec(),
+                    )
+                }
+                None => PermissionProfileSnapshot::legacy(
+                    config.permissions.permission_profile().clone(),
+                ),
+            };
+
+            apply_role_to_config_for_multi_agent_v2(&mut config, Some(&role_name))
+                .await
+                .map_err(CodexErr::InvalidRequest)?;
+            config
+                .permissions
+                .approval_policy
+                .set(runtime_approval_policy)
+                .map_err(|err| {
+                    CodexErr::InvalidRequest(format!("approval_policy is invalid: {err}"))
+                })?;
+            config.approvals_reviewer = runtime_approvals_reviewer;
+            config.cwd = runtime_cwd;
+            config
+                .permissions
+                .set_permission_profile_from_session_snapshot(runtime_permission_profile)
+                .map_err(|err| {
+                    CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
+                })?;
+        }
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, Some(thread_id))
             .await?;
 
-        let (session_source, _) = initial_history
-            .get_resumed_session_sources()
-            .unwrap_or((stored_source, None));
         let parent_thread_id = initial_history
             .get_resumed_parent_thread_id()
             .or(stored_parent_thread_id);
@@ -197,7 +365,7 @@ impl AgentControl {
     async fn spawn_agent_internal(
         &self,
         config: Config,
-        initial_operation: Op,
+        initial_input: SpawnInitialInput,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
@@ -278,10 +446,22 @@ impl AgentControl {
                 .await?
             }
             (Some(session_source), None, inheritance) => {
+                let history_mode = if let Some(parent_thread_id) = options.parent_thread_id
+                    && let Ok(parent_thread) = state.get_thread(parent_thread_id).await
+                {
+                    matches!(
+                        parent_thread.config_snapshot().await.history_mode,
+                        ThreadHistoryMode::Paginated
+                    )
+                    .then_some(ThreadHistoryMode::Paginated)
+                } else {
+                    None
+                };
                 Box::pin(state.spawn_new_thread_with_source(
                     config.clone(),
                     self.clone(),
                     session_source,
+                    history_mode,
                     options.parent_thread_id,
                     /*forked_from_thread_id*/ None,
                     /*thread_source*/ Some(ThreadSource::Subagent),
@@ -307,13 +487,7 @@ impl AgentControl {
         )) = notification_source.as_ref()
         {
             let client_metadata = match state.get_thread(*parent_thread_id).await {
-                Ok(parent_thread) => {
-                    parent_thread
-                        .codex
-                        .session
-                        .app_server_client_metadata()
-                        .await
-                }
+                Ok(parent_thread) => parent_thread.session.app_server_client_metadata().await,
                 Err(error) => {
                     tracing::warn!(
                         error = %error,
@@ -326,17 +500,12 @@ impl AgentControl {
                     }
                 }
             };
-            let thread_config = new_thread.thread.codex.thread_config_snapshot().await;
+            let thread_config = new_thread.thread.config_snapshot().await;
             let parent_thread_id = thread_config.parent_thread_id;
             emit_subagent_session_started(
-                &new_thread
-                    .thread
-                    .codex
-                    .session
-                    .services
-                    .analytics_events_client,
+                &new_thread.thread.session.services.analytics_events_client,
                 client_metadata,
-                new_thread.thread.codex.session.session_id(),
+                new_thread.thread.session.session_id(),
                 new_thread.thread_id,
                 parent_thread_id,
                 thread_config,
@@ -356,8 +525,27 @@ impl AgentControl {
         )
         .await;
 
-        self.send_input_after_capacity_check(new_thread.thread_id, &state, initial_operation)
-            .await?;
+        match initial_input {
+            SpawnInitialInput::UserInput(input) => {
+                self.send_input_after_capacity_check(
+                    new_thread.thread_id,
+                    &state,
+                    input,
+                    options.parent_turn_id,
+                )
+                .await?;
+            }
+            SpawnInitialInput::InterAgentCommunication(communication, context) => {
+                self.send_inter_agent_communication_after_capacity_check(
+                    new_thread.thread_id,
+                    &state,
+                    communication,
+                    context,
+                    options.parent_turn_id,
+                )
+                .await?;
+            }
+        }
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
                 .agent_path
@@ -412,30 +600,51 @@ impl AgentControl {
         };
 
         let parent_thread_id = *parent_thread_id;
-        let parent_thread = state.get_thread(parent_thread_id).await.ok();
-        if let Some(parent_thread) = parent_thread.as_ref() {
-            // `record_conversation_items` only queues persistence writes asynchronously.
-            // Flush before snapshotting store history for a fork.
-            parent_thread.ensure_rollout_materialized().await;
-            parent_thread.flush_rollout().await?;
-        }
+        let parent_thread = state.get_thread(parent_thread_id).await?;
+        let (subagent_developer_instructions, parent_developer_instructions) = match (
+            multi_agent_version,
+            config
+                .multi_agent_v2
+                .subagent_developer_instructions
+                .as_ref(),
+        ) {
+            (MultiAgentVersion::V2, Some(_)) => {
+                let parent_developer_instructions = match parent_thread
+                    .session
+                    .new_default_turn()
+                    .await
+                    .developer_instructions
+                    .clone()
+                {
+                    Some(instructions) if !instructions.is_empty() => Some(instructions),
+                    Some(_) | None => None,
+                };
+                (
+                    Some(config.developer_instructions.clone().unwrap_or_default()),
+                    parent_developer_instructions,
+                )
+            }
+            (MultiAgentVersion::Disabled | MultiAgentVersion::V1, _)
+            | (MultiAgentVersion::V2, None) => (None, None),
+        };
+        let parent_history_mode = parent_thread.config_snapshot().await.history_mode;
+        // `record_conversation_items` only queues persistence writes asynchronously.
+        // Flush before snapshotting store history for a fork.
+        parent_thread.ensure_rollout_materialized().await;
+        parent_thread.flush_rollout().await?;
 
-        let parent_history = state
-            .read_stored_thread(ReadThreadParams {
-                thread_id: parent_thread_id,
-                include_archived: true,
-                include_history: true,
-            })
-            .await?
-            .history
-            .ok_or_else(|| {
-                CodexErr::Fatal(format!(
-                    "parent thread history unavailable for fork: {parent_thread_id}"
-                ))
-            })?;
+        let destination_history_mode = matches!(parent_history_mode, ThreadHistoryMode::Paginated)
+            .then_some(ThreadHistoryMode::Paginated);
+        let mut forked_rollout_items =
+            load_agent_model_context(state, parent_thread_id, parent_history_mode)
+                .await?
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "parent thread history unavailable for fork: {parent_thread_id}"
+                    ))
+                })?;
 
-        let selected_capability_roots = parent_history
-            .items
+        let selected_capability_roots = forked_rollout_items
             .iter()
             .find_map(|item| {
                 let RolloutItem::SessionMeta(meta_line) = item else {
@@ -444,35 +653,22 @@ impl AgentControl {
                 Some(meta_line.meta.selected_capability_roots.clone())
             })
             .unwrap_or_default();
-        let mut forked_rollout_items = parent_history.items;
         if let SpawnAgentForkMode::LastNTurns(last_n_turns) = fork_mode {
             forked_rollout_items =
-                truncate_rollout_to_last_n_fork_turns(&forked_rollout_items, *last_n_turns);
+                truncate_rollout_to_last_n_fork_turns(forked_rollout_items, *last_n_turns);
         }
         let multi_agent_v2_usage_hint_texts_to_filter: Vec<String> =
-            if let Some(parent_thread) = parent_thread.as_ref() {
-                if multi_agent_version == MultiAgentVersion::V2 {
-                    let parent_config = parent_thread.codex.session.get_config().await;
-                    [
-                        parent_config
-                            .multi_agent_v2
-                            .root_agent_usage_hint_text
-                            .clone(),
-                        parent_config
-                            .multi_agent_v2
-                            .subagent_usage_hint_text
-                            .clone(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect()
-                } else {
-                    Vec::new()
-                }
-            } else if multi_agent_version == MultiAgentVersion::V2 {
+            if multi_agent_version == MultiAgentVersion::V2 {
+                let parent_config = parent_thread.session.get_config().await;
                 [
-                    config.multi_agent_v2.root_agent_usage_hint_text.clone(),
-                    config.multi_agent_v2.subagent_usage_hint_text.clone(),
+                    parent_config
+                        .multi_agent_v2
+                        .root_agent_usage_hint_text
+                        .clone(),
+                    parent_config
+                        .multi_agent_v2
+                        .subagent_usage_hint_text
+                        .clone(),
                 ]
                 .into_iter()
                 .flatten()
@@ -480,29 +676,124 @@ impl AgentControl {
             } else {
                 Vec::new()
             };
-        let preserve_reference_context_item = matches!(fork_mode, SpawnAgentForkMode::FullHistory);
-        forked_rollout_items.retain(|item| {
-            keep_forked_rollout_item(item, preserve_reference_context_item)
-                && !matches!(
-                    item,
-                    RolloutItem::ResponseItem(response_item)
-                        if is_multi_agent_v2_usage_hint_message(
-                            response_item,
-                            &multi_agent_v2_usage_hint_texts_to_filter,
-                        )
-                )
-        });
-        for item in &mut forked_rollout_items {
-            if let RolloutItem::Compacted(compacted) = item
-                && let Some(replacement_history) = compacted.replacement_history.as_mut()
-            {
-                replacement_history.retain(|response_item| {
-                    !is_multi_agent_v2_usage_hint_message(
-                        response_item,
-                        &multi_agent_v2_usage_hint_texts_to_filter,
-                    )
-                });
+        let mut preserve_reference_context_item =
+            matches!(fork_mode, SpawnAgentForkMode::FullHistory);
+        if preserve_reference_context_item {
+            for item in forked_rollout_items.iter().rev() {
+                let RolloutItem::Compacted(compacted) = item else {
+                    continue;
+                };
+                // Legacy checkpoints force the child to rebuild context regardless of the
+                // live parent's reference baseline; an older superseded checkpoint does not.
+                if compacted.replacement_history.is_none() {
+                    preserve_reference_context_item = false;
+                }
+                break;
             }
+        }
+        let mut replaced_parent_developer_instructions = false;
+        // Scrub inherited hints and replace only the parent's developer-instruction fragment.
+        // Compaction stores response items separately, so sanitize both top-level messages and
+        // compacted replacement histories with the same policy.
+        let retain_forked_item = |response_item: &mut ResponseItem, replaced: &mut bool| {
+            if matches!(response_item, ResponseItem::AgentMessage { .. }) {
+                return false;
+            }
+            if is_multi_agent_v2_usage_hint_message(
+                response_item,
+                &multi_agent_v2_usage_hint_texts_to_filter,
+            ) {
+                return false;
+            }
+
+            if let Some(parent_developer_instructions) = parent_developer_instructions.as_ref()
+                && let Some(subagent_developer_instructions) =
+                    subagent_developer_instructions.as_ref()
+                && let ResponseItem::Message { role, content, .. } = response_item
+                && role == "developer"
+            {
+                content.retain_mut(|content_item| {
+                    let ContentItem::InputText { text } = content_item else {
+                        return true;
+                    };
+                    // TODO(anp) track better message fragment provenance in rollouts.
+                    if !text.contains(parent_developer_instructions) {
+                        return true;
+                    }
+
+                    *replaced = true;
+                    let replacement = if preserve_reference_context_item {
+                        subagent_developer_instructions.as_str()
+                    } else {
+                        ""
+                    };
+                    *text = text.replace(parent_developer_instructions, replacement);
+                    !text.is_empty()
+                });
+                return !content.is_empty();
+            }
+
+            true
+        };
+        forked_rollout_items.retain_mut(|item| {
+            if !keep_forked_rollout_item(item, preserve_reference_context_item)
+                || destination_history_mode == Some(ThreadHistoryMode::Paginated)
+                    && matches!(
+                        &*item,
+                        RolloutItem::EventMsg(
+                            EventMsg::ItemCompleted(_)
+                                | EventMsg::TokenCount(_)
+                                | EventMsg::ThreadGoalUpdated(_)
+                                | EventMsg::ThreadSettingsApplied(_),
+                        )
+                    )
+            {
+                return false;
+            }
+
+            match item {
+                RolloutItem::ResponseItem(response_item) => {
+                    retain_forked_item(response_item, &mut replaced_parent_developer_instructions)
+                }
+                RolloutItem::Compacted(compacted) => {
+                    if let Some(replacement_history) = compacted.replacement_history.as_mut() {
+                        // Matches before this checkpoint cannot survive its replacement history.
+                        replaced_parent_developer_instructions = false;
+                        replacement_history.retain_mut(|response_item| {
+                            retain_forked_item(
+                                response_item,
+                                &mut replaced_parent_developer_instructions,
+                            )
+                        });
+                    }
+                    true
+                }
+                RolloutItem::EventMsg(_)
+                | RolloutItem::SessionMeta(_)
+                | RolloutItem::TurnContext(_)
+                | RolloutItem::InterAgentCommunication(_)
+                | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::WorldState(_) => true,
+            }
+        });
+        // Full forks reuse the parent's reference context instead of rebuilding it. If that
+        // context omitted the parent's developer fragment, append the child's override so its
+        // instructions still reach the model exactly once.
+        if let Some(subagent_developer_instructions) = subagent_developer_instructions.as_ref()
+            && preserve_reference_context_item
+            && !replaced_parent_developer_instructions
+            && !subagent_developer_instructions.is_empty()
+            && parent_thread
+                .session
+                .reference_context_item()
+                .await
+                .is_some()
+            && let Some(developer_message) =
+                crate::context_manager::updates::build_developer_update_item(vec![
+                    subagent_developer_instructions.clone(),
+                ])
+        {
+            forked_rollout_items.push(RolloutItem::ResponseItem(developer_message));
         }
         if preserve_reference_context_item
             && multi_agent_version == MultiAgentVersion::V2
@@ -522,6 +813,7 @@ impl AgentControl {
             .fork_thread_with_source(
                 config.clone(),
                 InitialHistory::Forked(forked_rollout_items),
+                destination_history_mode,
                 self.clone(),
                 session_source,
                 /*thread_source*/ Some(ThreadSource::Subagent),
@@ -622,7 +914,7 @@ impl AgentControl {
             .read_stored_thread(ReadThreadParams {
                 thread_id,
                 include_archived: true,
-                include_history: true,
+                include_history: false,
             })
             .await?;
         let resumed_agent_path = stored_thread
@@ -633,10 +925,9 @@ impl AgentControl {
             .map_err(|err| CodexErr::InvalidRequest(format!("invalid stored agent path: {err}")))?;
         let resumed_agent_nickname = stored_thread.agent_nickname.clone();
         let resumed_agent_role = stored_thread.agent_role.clone();
-        let history = stored_thread
-            .history
-            .ok_or_else(|| CodexErr::ThreadNotFound(thread_id))?
-            .items;
+        let history = load_agent_model_context(&state, thread_id, stored_thread.history_mode)
+            .await?
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
         let initial_history = InitialHistory::Resumed(ResumedHistory {
             conversation_id: thread_id,
             history: Arc::new(history),

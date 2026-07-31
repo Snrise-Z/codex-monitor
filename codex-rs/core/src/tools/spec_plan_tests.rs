@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use codex_features::Feature;
@@ -16,8 +15,6 @@ use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::openai_models::WebSearchToolType;
-use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use codex_tools::DiscoverablePluginInfo;
 use codex_tools::DiscoverableTool;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -31,25 +28,34 @@ use codex_tools::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
+use crate::WaitForEnvironmentToolConfig;
 use crate::config::CurrentTimeReminderConfig;
+use crate::environment_selection::TurnEnvironmentState;
+use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::mcp_config_for_test;
 use crate::session::turn_context::TurnContext;
+use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
+use crate::tools::handlers::WaitForEnvironmentHandler;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::override_tool_exposure;
 use crate::tools::router::ToolRouter;
-use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
+use crate::tools::spec_plan::append_source_tool_runtimes;
+use crate::tools::spec_plan::build_core_tool_runtimes;
 
 const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
 
 #[derive(Default)]
 struct ToolPlanInputs {
-    mcp_tools: Option<Vec<ToolInfo>>,
-    deferred_mcp_tools: Option<Vec<ToolInfo>>,
+    tool_runtimes: Vec<Arc<dyn CoreToolRuntime>>,
     tool_suggest_candidates: Option<ToolSuggestCandidates>,
     extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
+    wait_for_environment_tool_config: Option<Arc<WaitForEnvironmentToolConfig>>,
     dynamic_tools: Vec<DynamicToolSpec>,
 }
 
@@ -83,7 +89,6 @@ impl ToolPlanProbe {
                 )),
                 ToolSpec::Function(_)
                 | ToolSpec::ToolSearch { .. }
-                | ToolSpec::ImageGeneration { .. }
                 | ToolSpec::WebSearch { .. }
                 | ToolSpec::Freeform(_) => None,
             })
@@ -185,15 +190,24 @@ async fn probe_with(
     configure_turn(&mut turn);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
-    let router = ToolRouter::from_context(
-        step_context.as_ref(),
-        ToolRouterParams {
-            tool_suggest_candidates: inputs.tool_suggest_candidates,
-            mcp_tools: inputs.mcp_tools,
-            deferred_mcp_tools: inputs.deferred_mcp_tools,
-            extension_tool_executors: inputs.extension_tool_executors,
-            dynamic_tools: inputs.dynamic_tools.as_slice(),
-        },
+    let mut tool_runtimes = build_core_tool_runtimes(
+        step_context.turn.as_ref(),
+        &step_context.environments,
+        step_context.mcp.as_ref(),
+        inputs.tool_suggest_candidates.as_ref(),
+        inputs.wait_for_environment_tool_config.as_ref(),
+    );
+    let hosted_specs = append_source_tool_runtimes(
+        step_context.turn.as_ref(),
+        &mut tool_runtimes,
+        inputs.tool_runtimes,
+        inputs.extension_tool_executors,
+        &inputs.dynamic_tools,
+    );
+    let router = ToolRouter::from_tools(
+        step_context.turn.as_ref(),
+        tool_runtimes,
+        hosted_specs,
         &Default::default(),
     );
     ToolPlanProbe::from_router(router)
@@ -275,40 +289,23 @@ fn use_bedrock_provider(turn: &mut TurnContext) {
     turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
 }
 
-fn use_actor_authorized_provider(turn: &mut TurnContext) {
-    let mut provider_info = turn.config.model_provider.clone();
-    provider_info.requires_openai_auth = false;
-    provider_info.http_headers = Some(HashMap::from([
-        (
-            "x-openai-actor-authorization".to_string(),
-            "test-actor-authorization".to_string(),
-        ),
-        (
-            "ChatGPT-Account-ID".to_string(),
-            "test-account-id".to_string(),
-        ),
-    ]));
-    turn.auth_manager = None;
-    update_config(turn, |config| {
-        config.model_provider = provider_info.clone();
-    });
-    turn.provider = create_model_provider(provider_info, /*auth_manager*/ None);
+struct TestNamespaceExtensionTool {
+    namespace: &'static str,
+    tool_name: &'static str,
 }
 
-struct WebRunExtensionTool;
-
-impl ToolExecutor<ExtensionToolCall> for WebRunExtensionTool {
+impl ToolExecutor<ExtensionToolCall> for TestNamespaceExtensionTool {
     fn tool_name(&self) -> ToolName {
-        ToolName::namespaced("web", "run")
+        ToolName::namespaced(self.namespace, self.tool_name)
     }
 
     fn spec(&self) -> ToolSpec {
         ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
-            name: "web".to_string(),
-            description: "Test web namespace.".to_string(),
+            name: self.namespace.to_string(),
+            description: "Test namespace.".to_string(),
             tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-                name: "run".to_string(),
-                description: "Test standalone web search tool.".to_string(),
+                name: self.tool_name.to_string(),
+                description: "Test namespace tool.".to_string(),
                 strict: false,
                 defer_loading: None,
                 parameters: codex_tools::JsonSchema::default(),
@@ -359,9 +356,15 @@ impl ToolExecutor<ExtensionToolCall> for DeferredExtensionTool {
 }
 
 fn duplicate_primary_environment(turn: &mut TurnContext) {
-    let mut second_environment = turn.environments.turn_environments[0].clone();
+    let mut second_environment = turn
+        .environments
+        .primary()
+        .expect("primary environment")
+        .clone();
     second_environment.environment_id = "secondary".to_string();
-    turn.environments.turn_environments.push(second_environment);
+    turn.environments
+        .environments
+        .push(TurnEnvironmentState::Ready(second_environment));
 }
 
 fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
@@ -381,18 +384,23 @@ fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
                 "additionalProperties": false,
             }))),
         ),
+        openai_file_input_optional_fields: Default::default(),
         connector_id: None,
         connector_name: None,
         plugin_display_names: Vec::new(),
     }
 }
 
-fn invalid_mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
-    let mut tool = mcp_tool(server, namespace, name);
-    tool.tool.input_schema = Arc::new(rmcp::model::object(json!({
-        "type": "null",
-    })));
-    tool
+fn mcp_runtime(
+    server: &str,
+    namespace: &str,
+    name: &str,
+    exposure: ToolExposure,
+) -> Arc<dyn CoreToolRuntime> {
+    let handler: Arc<dyn CoreToolRuntime> = Arc::new(
+        McpHandler::new(mcp_tool(server, namespace, name)).expect("MCP tool spec should build"),
+    );
+    override_tool_exposure(handler, exposure)
 }
 
 fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> DynamicToolSpec {
@@ -452,6 +460,129 @@ fn apply_patch_accepts_environment_id(spec: &ToolSpec) -> bool {
 }
 
 #[tokio::test]
+async fn wait_for_environment_requires_feature_and_uses_host_config_when_present() {
+    const TOOL_DESCRIPTION: &str = "Host-provided wait tool description";
+    const ENVIRONMENT_ID_DESCRIPTION: &str = "Host-provided environment ID description";
+
+    for deferred_executor_enabled in [false, true] {
+        for config_present in [false, true] {
+            let wait_for_environment_tool_config = config_present.then(|| {
+                Arc::new(WaitForEnvironmentToolConfig {
+                    tool_description: TOOL_DESCRIPTION.to_string(),
+                    environment_id_description: ENVIRONMENT_ID_DESCRIPTION.to_string(),
+                })
+            });
+            let plan = probe_with(
+                |turn| {
+                    set_feature(turn, Feature::DeferredExecutor, deferred_executor_enabled);
+                },
+                ToolPlanInputs {
+                    wait_for_environment_tool_config,
+                    ..ToolPlanInputs::default()
+                },
+            )
+            .await;
+
+            if deferred_executor_enabled {
+                plan.assert_visible_contains(&["wait_for_environment"]);
+                plan.assert_registered_contains(&["wait_for_environment"]);
+                if !config_present {
+                    assert_eq!(
+                        plan.visible_spec("wait_for_environment"),
+                        &WaitForEnvironmentHandler::default().spec()
+                    );
+                    continue;
+                }
+                let ToolSpec::Function(ResponsesApiTool {
+                    description,
+                    parameters,
+                    ..
+                }) = plan.visible_spec("wait_for_environment")
+                else {
+                    panic!("expected wait_for_environment function spec");
+                };
+                assert_eq!(description, TOOL_DESCRIPTION);
+                assert_eq!(
+                    parameters
+                        .properties
+                        .as_ref()
+                        .and_then(|properties| properties.get("environment_id"))
+                        .and_then(|schema| schema.description.as_deref()),
+                    Some(ENVIRONMENT_ID_DESCRIPTION)
+                );
+            } else {
+                plan.assert_visible_lacks(&["wait_for_environment"]);
+                plan.assert_registered_lacks(&["wait_for_environment"]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn wait_for_environment_falls_back_for_oversized_host_configuration() {
+    const MAX_COMBINED_DESCRIPTION_BYTES: usize = 1_024;
+
+    for (tool_description, environment_id_description) in [
+        (
+            "x".repeat(MAX_COMBINED_DESCRIPTION_BYTES + 1),
+            String::new(),
+        ),
+        (
+            String::new(),
+            "x".repeat(MAX_COMBINED_DESCRIPTION_BYTES + 1),
+        ),
+        ("x".repeat(512), "x".repeat(513)),
+        // The descriptions fit the aggregate input cap, but the complete serialized schema does
+        // not fit its model-context cap once the surrounding tool definition is included.
+        ("x".repeat(500), "x".repeat(500)),
+    ] {
+        let configured_tool_description = tool_description.clone();
+        let configured_environment_id_description = environment_id_description.clone();
+        let plan = probe_with(
+            |turn| {
+                set_feature(turn, Feature::DeferredExecutor, /*enabled*/ true);
+            },
+            ToolPlanInputs {
+                wait_for_environment_tool_config: Some(Arc::new(WaitForEnvironmentToolConfig {
+                    tool_description,
+                    environment_id_description,
+                })),
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+
+        plan.assert_visible_contains(&["wait_for_environment"]);
+        plan.assert_registered_contains(&["wait_for_environment"]);
+        let ToolSpec::Function(ResponsesApiTool {
+            description,
+            parameters,
+            ..
+        }) = plan.visible_spec("wait_for_environment")
+        else {
+            panic!("expected wait_for_environment function spec");
+        };
+        let environment_id_description = parameters
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("environment_id"))
+            .and_then(|schema| schema.description.as_deref())
+            .expect("environment_id description should be present");
+        assert_ne!(description, &configured_tool_description);
+        assert_ne!(
+            environment_id_description,
+            configured_environment_id_description
+        );
+        assert!(
+            serde_json::to_vec(plan.visible_spec("wait_for_environment"))
+                .expect("tool spec should serialize")
+                .len()
+                <= 1_000
+        );
+    }
+}
+
+#[tokio::test]
 async fn request_user_input_tool_respects_experimental_config_gate() {
     let enabled = probe(|_| {}).await;
     enabled.assert_visible_contains(&["request_user_input"]);
@@ -469,6 +600,22 @@ async fn request_user_input_tool_respects_experimental_config_gate() {
     .await;
     disabled.assert_visible_lacks(&["request_user_input"]);
     disabled.assert_registered_lacks(&["request_user_input"]);
+}
+
+#[tokio::test]
+async fn update_plan_tool_respects_config_gate() {
+    let enabled = probe(|_| {}).await;
+    enabled.assert_visible_contains(&["update_plan"]);
+    enabled.assert_registered_contains(&["update_plan"]);
+
+    let disabled = probe(|turn| {
+        update_config(turn, |config| {
+            config.update_plan_enabled = false;
+        });
+    })
+    .await;
+    disabled.assert_visible_lacks(&["update_plan"]);
+    disabled.assert_registered_lacks(&["update_plan"]);
 }
 
 #[tokio::test]
@@ -600,19 +747,22 @@ async fn zsh_fork_unified_exec_keeps_shell_parameter_when_remote_environment_ava
             .expect("primary environment")
             .cwd()
             .clone();
-        turn.environments.turn_environments.push(
-            crate::session::turn_context::TurnEnvironment::new(
-                "remote".to_string(),
-                Arc::new(
-                    codex_exec_server::Environment::create_for_tests(Some(
-                        "ws://127.0.0.1:1/remote-exec-server".to_string(),
-                    ))
-                    .expect("remote test environment"),
+        turn.environments
+            .environments
+            .push(TurnEnvironmentState::Ready(
+                crate::session::turn_context::TurnEnvironment::new(
+                    "remote".to_string(),
+                    Arc::new(
+                        codex_exec_server::Environment::create_for_tests(Some(
+                            "ws://127.0.0.1:1/remote-exec-server".to_string(),
+                        ))
+                        .expect("remote test environment"),
+                    ),
+                    remote_cwd,
+                    Vec::new(),
+                    /*shell*/ None,
                 ),
-                remote_cwd,
-                /*shell*/ None,
-            ),
-        );
+            ));
     })
     .await;
 
@@ -627,7 +777,7 @@ async fn zsh_fork_unified_exec_keeps_shell_parameter_when_remote_environment_ava
 #[tokio::test]
 async fn environment_count_controls_environment_backed_tools() {
     let no_environment = probe(|turn| {
-        turn.environments.turn_environments.clear();
+        turn.environments.environments.clear();
         set_feature(turn, Feature::ShellTool, /*enabled*/ true);
         set_feature(turn, Feature::RequestPermissionsTool, /*enabled*/ true);
         turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
@@ -682,47 +832,26 @@ async fn environment_tools_follow_the_step_context() {
     turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
 
     let environments = turn.environments.clone();
-    turn.environments.turn_environments.clear();
+    turn.environments.environments.clear();
     let turn = Arc::new(turn);
-    let step_context = Arc::new(StepContext::new(
-        Arc::clone(&turn),
-        environments,
-        Vec::new(),
-        crate::session::McpRuntimeSnapshot::new_uninitialized_for_test(&turn.config),
-        /*loaded_agents_md*/ None,
-    ));
+    let mcp = Arc::new(codex_mcp::McpBinding::empty(mcp_config_for_test(
+        &turn.config,
+    )));
 
-    let plan = ToolPlanProbe::from_router(ToolRouter::from_context(
-        step_context.as_ref(),
-        ToolRouterParams {
-            mcp_tools: None,
-            deferred_mcp_tools: None,
-            tool_suggest_candidates: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: &[],
-        },
+    let plan = ToolPlanProbe::from_router(ToolRouter::from_tools(
+        turn.as_ref(),
+        build_core_tool_runtimes(
+            turn.as_ref(),
+            &environments,
+            mcp.as_ref(),
+            /*tool_suggest_candidates*/ None,
+            /*wait_for_environment_tool_config*/ None,
+        ),
+        super::hosted_model_tool_specs(turn.as_ref(), &[]),
         &Default::default(),
     ));
 
     plan.assert_visible_contains(&["exec_command", "apply_patch", "view_image"]);
-}
-
-#[tokio::test]
-async fn host_context_gates_agent_job_tools() {
-    let normal_agent_job = probe(|turn| {
-        set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);
-    })
-    .await;
-    normal_agent_job.assert_visible_contains(&["spawn_agents_on_csv"]);
-    normal_agent_job.assert_visible_lacks(&["report_agent_job_result"]);
-
-    let worker_agent_job = probe(|turn| {
-        set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);
-        turn.session_source =
-            SessionSource::SubAgent(SubAgentSource::Other("agent_job:42".to_string()));
-    })
-    .await;
-    worker_agent_job.assert_visible_contains(&["spawn_agents_on_csv", "report_agent_job_result"]);
 }
 
 #[tokio::test]
@@ -750,27 +879,81 @@ async fn sleep_tool_follows_current_time_config() {
 }
 
 #[tokio::test]
+async fn sleep_tool_stays_direct_and_outside_code_mode() {
+    for code_mode_only in [false, true] {
+        let plan = probe(|turn| {
+            set_features(
+                turn,
+                &[
+                    Feature::CodeMode,
+                    Feature::CurrentTimeReminder,
+                    Feature::MultiAgentV2,
+                ],
+            );
+            if code_mode_only {
+                set_feature(turn, Feature::CodeModeOnly, /*enabled*/ true);
+            }
+            update_config(turn, |config| {
+                config.current_time_reminder = Some(CurrentTimeReminderConfig {
+                    sleep_tool: true,
+                    ..CurrentTimeReminderConfig::default()
+                });
+                config.multi_agent_v2.wait_agent_enabled = false;
+            });
+        })
+        .await;
+
+        assert!(
+            plan.namespace_function_names("clock")
+                .iter()
+                .any(|name| name == "sleep")
+        );
+        let sleep_tool_name = ToolName::namespaced("clock", "sleep").to_string();
+        let wait_agent_tool_name =
+            ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "wait_agent").to_string();
+        assert_eq!(
+            plan.exposure(&sleep_tool_name),
+            ToolExposure::DirectModelOnly
+        );
+        plan.assert_registered_lacks(&[wait_agent_tool_name.as_str()]);
+
+        let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+            panic!("expected code mode exec tool");
+        };
+        if code_mode_only {
+            assert!(exec.description.contains("clock__curr_time"));
+        }
+        assert!(!exec.description.contains("clock__sleep"));
+    }
+}
+
+#[tokio::test]
 async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
     let direct_mcp = probe_with(
         |_| {},
         ToolPlanInputs {
-            mcp_tools: Some(vec![mcp_tool("direct", "mcp__direct", "lookup")]),
+            tool_runtimes: vec![mcp_runtime(
+                "direct",
+                "mcp__direct",
+                "lookup",
+                ToolExposure::Direct,
+            )],
             ..ToolPlanInputs::default()
         },
     )
     .await;
-    direct_mcp.assert_visible_contains(&[
-        "list_mcp_resources",
-        "list_mcp_resource_templates",
-        "read_mcp_resource",
-    ]);
     assert_eq!(
         direct_mcp.namespace_function_names("mcp__direct"),
         &["lookup".to_string()]
     );
 
     let searchable_mcp = ToolPlanInputs {
-        deferred_mcp_tools: Some(vec![mcp_tool("searchable", "mcp__searchable", "lookup")]),
+        tool_runtimes: vec![mcp_runtime(
+            "searchable",
+            "mcp__searchable",
+            "lookup",
+            ToolExposure::Deferred,
+        )],
         ..ToolPlanInputs::default()
     };
 
@@ -779,7 +962,7 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
             turn.model_info.supports_search_tool = false;
         },
         ToolPlanInputs {
-            deferred_mcp_tools: searchable_mcp.deferred_mcp_tools.clone(),
+            tool_runtimes: searchable_mcp.tool_runtimes.clone(),
             ..ToolPlanInputs::default()
         },
     )
@@ -804,7 +987,7 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
             use_bedrock_provider(turn);
         },
         ToolPlanInputs {
-            deferred_mcp_tools: searchable_mcp.deferred_mcp_tools.clone(),
+            tool_runtimes: searchable_mcp.tool_runtimes.clone(),
             ..ToolPlanInputs::default()
         },
     )
@@ -823,6 +1006,165 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
         "tool_search",
         &ToolName::namespaced("mcp__searchable", "lookup").to_string(),
     ]);
+}
+
+#[tokio::test]
+async fn unified_tool_runtimes_preserve_source_order_and_collision_priority() {
+    let plan = probe_with(
+        |turn| {
+            set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
+            set_feature(turn, Feature::ShellZshFork, /*enabled*/ false);
+            turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![mcp_runtime(
+                "registry",
+                "mcp__registry",
+                "lookup",
+                ToolExposure::Direct,
+            )],
+            extension_tool_executors: vec![
+                Arc::new(TestNamespaceExtensionTool {
+                    namespace: "mcp__registry",
+                    tool_name: "lookup",
+                }),
+                Arc::new(TestNamespaceExtensionTool {
+                    namespace: "registry_extension",
+                    tool_name: "lookup",
+                }),
+            ],
+            dynamic_tools: vec![dynamic_tool(
+                Some("registry_dynamic"),
+                "lookup",
+                /*defer_loading*/ false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let expected_source_order = [
+        "exec_command",
+        "mcp__registry",
+        "registry_extension",
+        "registry_dynamic",
+    ];
+    let source_order = plan
+        .visible_names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| expected_source_order.contains(name))
+        .collect::<Vec<_>>();
+    assert_eq!(source_order, expected_source_order);
+
+    let mcp_tool_name = ToolName::namespaced("mcp__registry", "lookup").to_string();
+    let extension_tool_name = ToolName::namespaced("registry_extension", "lookup").to_string();
+    let dynamic_tool_name = ToolName::namespaced("registry_dynamic", "lookup").to_string();
+    plan.assert_registered_contains(&[
+        "exec_command",
+        &mcp_tool_name,
+        &extension_tool_name,
+        &dynamic_tool_name,
+    ]);
+    assert_eq!(
+        plan.namespace_function_names("mcp__registry"),
+        &["lookup".to_string()]
+    );
+
+    let ToolSpec::Namespace(namespace) = plan.visible_spec("mcp__registry") else {
+        panic!("expected the MCP namespace to stay visible");
+    };
+    let [ResponsesApiNamespaceTool::Function(tool)] = namespace.tools.as_slice() else {
+        panic!("expected exactly one MCP tool after the extension collision");
+    };
+    assert_eq!(tool.description, "lookup test tool");
+}
+
+#[tokio::test]
+async fn code_mode_uses_the_first_normalized_tool_identity() {
+    for (code_mode_only, winner_exposure, shadow_is_deferred) in [
+        (false, ToolExposure::Direct, true),
+        (false, ToolExposure::Deferred, false),
+        (true, ToolExposure::Direct, true),
+        (true, ToolExposure::Deferred, false),
+    ] {
+        let mut metadata_state = None;
+        let plan = probe_with(
+            |turn| {
+                set_feature(turn, Feature::CodeMode, /*enabled*/ true);
+                if code_mode_only {
+                    set_feature(turn, Feature::CodeModeOnly, /*enabled*/ true);
+                }
+                turn.model_info.supports_search_tool = true;
+                turn.model_info.use_responses_lite = true;
+                metadata_state = Some(Arc::clone(&turn.turn_metadata_state));
+            },
+            ToolPlanInputs {
+                tool_runtimes: vec![mcp_runtime(
+                    "winner",
+                    "normalized-alias",
+                    "lookup",
+                    winner_exposure,
+                )],
+                dynamic_tools: vec![dynamic_tool(
+                    Some("normalized_alias"),
+                    "lookup",
+                    shadow_is_deferred,
+                )],
+                ..ToolPlanInputs::default()
+            },
+        )
+        .await;
+
+        let winner_name = ToolName::namespaced("normalized-alias", "lookup");
+        let shadow_name = ToolName::namespaced("normalized_alias", "lookup");
+        plan.assert_registered_contains(&[&winner_name.to_string(), &shadow_name.to_string()]);
+        assert_eq!(plan.exposure(&winner_name.to_string()), winner_exposure);
+        assert_eq!(
+            plan.exposure(&shadow_name.to_string()),
+            if shadow_is_deferred {
+                ToolExposure::Deferred
+            } else {
+                ToolExposure::Direct
+            },
+        );
+
+        let metadata = metadata_state
+            .expect("tool planning should capture the turn metadata")
+            .to_responses_metadata(
+                "installation".to_string(),
+                "window".to_string(),
+                CodexResponsesRequestKind::Turn,
+            );
+        let code_mode_tool_names = metadata
+            .code_mode_tool_names
+            .as_ref()
+            .expect("Responses Lite should receive the supported code-mode tools");
+        assert_eq!(
+            code_mode_tool_names.get("normalized_alias__lookup"),
+            Some(&winner_name),
+        );
+        assert!(!code_mode_tool_names.contains_key(codex_tools::TOOL_SEARCH_TOOL_NAME));
+
+        if !code_mode_only && !shadow_is_deferred {
+            let ToolSpec::Namespace(namespace) = plan.visible_spec("normalized_alias") else {
+                panic!("expected the shadowed dynamic tool to remain directly visible");
+            };
+            let [ResponsesApiNamespaceTool::Function(shadow)] = namespace.tools.as_slice() else {
+                panic!("expected exactly one shadowed dynamic tool");
+            };
+            assert_eq!(shadow.description, "lookup dynamic tool");
+        }
+
+        let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+            panic!("expected code mode exec tool");
+        };
+        assert!(!exec.description.contains("lookup dynamic tool"));
+        assert_eq!(
+            exec.description.contains("lookup test tool"),
+            code_mode_only && winner_exposure == ToolExposure::Direct,
+        );
+    }
 }
 
 #[tokio::test]
@@ -852,15 +1194,23 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     first_turn.model_info.supports_search_tool = true;
     let first_turn = Arc::new(first_turn);
     let first_step_context = StepContext::for_test(Arc::clone(&first_turn));
-    let first_router = ToolRouter::from_context(
-        first_step_context.as_ref(),
-        ToolRouterParams {
-            mcp_tools: None,
-            deferred_mcp_tools: Some(vec![mcp_tool("first", "mcp__first", "lookup")]),
-            tool_suggest_candidates: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: &[],
-        },
+    let mut first_tool_runtimes = build_core_tool_runtimes(
+        first_step_context.turn.as_ref(),
+        &first_step_context.environments,
+        first_step_context.mcp.as_ref(),
+        /*tool_suggest_candidates*/ None,
+        /*wait_for_environment_tool_config*/ None,
+    );
+    first_tool_runtimes.push(mcp_runtime(
+        "first",
+        "mcp__first",
+        "lookup",
+        ToolExposure::Deferred,
+    ));
+    let first_router = ToolRouter::from_tools(
+        first_step_context.turn.as_ref(),
+        first_tool_runtimes,
+        super::hosted_model_tool_specs(first_step_context.turn.as_ref(), &[]),
         &cache,
     );
     let first_plan = ToolPlanProbe::from_router(first_router);
@@ -869,15 +1219,23 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     second_turn.model_info.supports_search_tool = true;
     let second_turn = Arc::new(second_turn);
     let second_step_context = StepContext::for_test(Arc::clone(&second_turn));
-    let second_router = ToolRouter::from_context(
-        second_step_context.as_ref(),
-        ToolRouterParams {
-            mcp_tools: None,
-            deferred_mcp_tools: Some(vec![mcp_tool("second", "mcp__second", "lookup")]),
-            tool_suggest_candidates: None,
-            extension_tool_executors: Vec::new(),
-            dynamic_tools: &[],
-        },
+    let mut second_tool_runtimes = build_core_tool_runtimes(
+        second_step_context.turn.as_ref(),
+        &second_step_context.environments,
+        second_step_context.mcp.as_ref(),
+        /*tool_suggest_candidates*/ None,
+        /*wait_for_environment_tool_config*/ None,
+    );
+    second_tool_runtimes.push(mcp_runtime(
+        "second",
+        "mcp__second",
+        "lookup",
+        ToolExposure::Deferred,
+    ));
+    let second_router = ToolRouter::from_tools(
+        second_step_context.turn.as_ref(),
+        second_tool_runtimes,
+        super::hosted_model_tool_specs(second_step_context.turn.as_ref(), &[]),
         &cache,
     );
     let second_plan = ToolPlanProbe::from_router(second_router);
@@ -904,18 +1262,49 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
 }
 
 #[tokio::test]
-async fn invalid_mcp_tools_are_not_registered() {
-    let plan = probe_with(
-        |_| {},
-        ToolPlanInputs {
-            mcp_tools: Some(vec![invalid_mcp_tool("invalid", "mcp__invalid", "lookup")]),
-            ..ToolPlanInputs::default()
-        },
-    )
-    .await;
+async fn tool_search_cache_rebuilds_when_deferred_world_state_changes() {
+    let cache = ToolSearchHandlerCache::default();
 
-    plan.assert_visible_lacks(&["mcp__invalid"]);
-    plan.assert_registered_lacks(&[&ToolName::namespaced("mcp__invalid", "lookup").to_string()]);
+    for world_state_enabled in [false, true, false] {
+        let (_session, mut turn) = make_session_and_context().await;
+        turn.model_info.supports_search_tool = true;
+        set_feature(
+            &mut turn,
+            Feature::DeferredToolWorldState,
+            world_state_enabled,
+        );
+        let turn = Arc::new(turn);
+        let step_context = StepContext::for_test(Arc::clone(&turn));
+        let mut tool_runtimes = build_core_tool_runtimes(
+            step_context.turn.as_ref(),
+            &step_context.environments,
+            step_context.mcp.as_ref(),
+            /*tool_suggest_candidates*/ None,
+            /*wait_for_environment_tool_config*/ None,
+        );
+        tool_runtimes.push(mcp_runtime(
+            "calendar",
+            "mcp__calendar",
+            "lookup",
+            ToolExposure::Deferred,
+        ));
+        let router = ToolRouter::from_tools(
+            step_context.turn.as_ref(),
+            tool_runtimes,
+            super::hosted_model_tool_specs(step_context.turn.as_ref(), &[]),
+            &cache,
+        );
+        let plan = ToolPlanProbe::from_router(router);
+        let ToolSpec::ToolSearch { description, .. } = plan.visible_spec("tool_search") else {
+            panic!("expected visible tool_search spec");
+        };
+
+        assert_eq!(
+            description.contains("- calendar: Tools from calendar."),
+            !world_state_enabled,
+            "tool search cache should follow the deferred world-state feature"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1011,7 +1400,7 @@ async fn request_plugin_install_stays_visible_without_tool_search() {
 }
 
 #[tokio::test]
-async fn request_plugin_install_description_refers_to_recommended_plugins_hint() {
+async fn request_plugin_install_description_requires_exhausting_tool_search() {
     let plan = probe_with(
         |turn| {
             set_features(
@@ -1036,7 +1425,11 @@ async fn request_plugin_install_description_refers_to_recommended_plugins_hint()
     else {
         panic!("expected request_plugin_install function spec");
     };
-    assert!(request_description.contains("the `<recommended_plugins>` list"));
+    assert!(request_description.contains("listed in `<recommended_plugins>`"));
+    assert!(request_description.contains("explicitly asks to use a specific plugin"));
+    assert!(request_description.contains("Tool search has already been exhausted"));
+    assert!(!request_description.contains("`tool_search`"));
+    assert!(request_description.contains("DO NOT call this tool in parallel with other tools"));
     assert!(!request_description.contains("list_available_plugins_to_install"));
     assert!(!request_description.contains("github"));
     assert!(has_parameter(request_spec, "plugin_id"));
@@ -1090,6 +1483,20 @@ async fn code_mode_only_exposes_code_executor_and_hides_nested_tools() {
         code_mode_only.namespace_function_names("codex_app"),
         Vec::<String>::new().as_slice()
     );
+}
+
+#[tokio::test]
+async fn code_mode_buffered_exec_updates_exec_description() {
+    let plan = probe(|turn| {
+        set_features(turn, &[Feature::CodeMode, Feature::CodeModeBufferedExec]);
+    })
+    .await;
+
+    let ToolSpec::Freeform(exec) = plan.visible_spec(codex_code_mode::PUBLIC_TOOL_NAME) else {
+        panic!("expected code mode exec tool");
+    };
+    assert!(exec.description.contains("Defaults to 30000 ms."));
+    assert!(!exec.description.contains("Defaults to 10000 ms."));
 }
 
 #[tokio::test]
@@ -1218,12 +1625,13 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         .properties
         .as_ref()
         .expect("spawn_agent should use object params");
-    for property in ["agent_type", "model", "reasoning_effort", "service_tier"] {
+    for property in ["model", "reasoning_effort", "service_tier"] {
         assert!(
             properties.contains_key(property),
             "expected v1 spawn_agent to expose `{property}`"
         );
     }
+    assert!(!properties.contains_key("agent_type"));
 
     let v2 = probe(|turn| {
         set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
@@ -1273,6 +1681,17 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     else {
         panic!("expected spawn_agent in {MULTI_AGENT_V2_NAMESPACE} namespace");
     };
+    let spawn_agent_properties = spawn_agent
+        .parameters
+        .properties
+        .as_ref()
+        .expect("spawn_agent should use object params");
+    for property in ["model", "reasoning_effort"] {
+        assert!(spawn_agent_properties.contains_key(property));
+    }
+    for property in ["agent_type", "service_tier"] {
+        assert!(!spawn_agent_properties.contains_key(property));
+    }
     let spawn_agent_description = spawn_agent.description.as_str();
     assert!(!spawn_agent_description.contains("max_concurrent_threads_per_session"));
     assert!(spawn_agent_description.contains(
@@ -1332,6 +1751,30 @@ async fn multi_agent_v2_message_schemas_are_encrypted() {
             Some(true)
         );
     }
+}
+
+#[tokio::test]
+async fn multi_agent_v2_can_disable_wait_agent() {
+    let plan = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.multi_agent_v2.wait_agent_enabled = false;
+        });
+    })
+    .await;
+
+    assert_eq!(
+        plan.namespace_function_names(MULTI_AGENT_V2_NAMESPACE),
+        &[
+            "followup_task".to_string(),
+            "interrupt_agent".to_string(),
+            "list_agents".to_string(),
+            "send_message".to_string(),
+            "spawn_agent".to_string(),
+        ]
+    );
+    plan.assert_visible_lacks(&["clock"]);
+    plan.assert_registered_lacks(&["collaboration.wait_agent", "clock.sleep"]);
 }
 
 #[tokio::test]
@@ -1497,7 +1940,7 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
             "wait",
             "request_user_input",
             "agents",
-            // Hosted Responses tools.
+            // Hosted Responses tool.
             "web_search",
         ]
     );
@@ -1526,79 +1969,93 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
 }
 
 #[tokio::test]
-async fn hosted_tools_follow_provider_auth_model_and_config_gates() {
-    let api_key_auth = probe(|turn| {
-        set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
-        turn.model_info.input_modalities = vec![InputModality::Image];
-    })
+async fn hosted_web_search_fallback_follows_winning_browser_runtime() {
+    let plan = probe_with(
+        |turn| {
+            set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+            set_web_search_mode(turn, WebSearchMode::Live);
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![mcp_runtime(
+                "browser_collision",
+                "web",
+                "run",
+                ToolExposure::Direct,
+            )],
+            extension_tool_executors: vec![Arc::new(TestNamespaceExtensionTool {
+                namespace: "web",
+                tool_name: "run",
+            })],
+            ..ToolPlanInputs::default()
+        },
+    )
     .await;
-    api_key_auth.assert_visible_lacks(&["image_generation"]);
 
-    let unrelated_chatgpt_auth = probe(|turn| {
-        use_chatgpt_auth(turn);
-        set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
-        let mut provider_info = turn.provider.info().clone();
-        provider_info.requires_openai_auth = false;
-        provider_info.http_headers = None;
-        update_config(turn, |config| {
-            config.model_provider = provider_info.clone();
-        });
-        turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
-        turn.model_info.input_modalities = vec![InputModality::Image];
-    })
-    .await;
-    unrelated_chatgpt_auth.assert_visible_lacks(&["image_generation"]);
+    let ToolSpec::Namespace(namespace) = plan.visible_spec("web") else {
+        panic!("expected the winning browser namespace");
+    };
+    assert_eq!(namespace.description, "Tools from browser_collision.");
+    plan.assert_visible_contains(&["web_search"]);
+}
 
-    let actor_authorized_provider = probe(|turn| {
-        set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
-        use_actor_authorized_provider(turn);
-        turn.model_info.input_modalities = vec![InputModality::Image];
-    })
+#[tokio::test]
+async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates() {
+    let image_generation_tool = Arc::new(TestNamespaceExtensionTool {
+        namespace: "image_gen",
+        tool_name: "imagegen",
+    });
+    let image_generation = probe_with(
+        |turn| {
+            use_chatgpt_auth(turn);
+            turn.model_info.input_modalities = vec![InputModality::Image];
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![image_generation_tool.clone()],
+            ..Default::default()
+        },
+    )
     .await;
-    actor_authorized_provider.assert_visible_contains(&["image_generation"]);
+    image_generation.assert_visible_contains(&["image_gen"]);
 
-    let feature_disabled = probe(|turn| {
-        set_feature(turn, Feature::ImageGeneration, /*enabled*/ false);
-        use_actor_authorized_provider(turn);
-        turn.model_info.input_modalities = vec![InputModality::Image];
-    })
+    let extension_disabled = probe_with(
+        |turn| {
+            use_chatgpt_auth(turn);
+            set_feature(turn, Feature::ImageGeneration, /*enabled*/ false);
+            turn.model_info.input_modalities = vec![InputModality::Image];
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![image_generation_tool.clone()],
+            ..Default::default()
+        },
+    )
     .await;
-    feature_disabled.assert_visible_lacks(&["image_generation"]);
+    extension_disabled.assert_visible_lacks(&["image_gen"]);
 
-    let text_only_model = probe(|turn| {
-        set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
-        use_actor_authorized_provider(turn);
-        turn.model_info.input_modalities = vec![];
-    })
+    let text_only_model = probe_with(
+        |turn| {
+            use_chatgpt_auth(turn);
+            turn.model_info.input_modalities = vec![];
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![image_generation_tool.clone()],
+            ..Default::default()
+        },
+    )
     .await;
-    text_only_model.assert_visible_lacks(&["image_generation"]);
+    text_only_model.assert_visible_lacks(&["image_gen"]);
 
-    let unsupported_image_generation_provider = probe(|turn| {
-        set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
-        use_bedrock_provider(turn);
-        use_actor_authorized_provider(turn);
-        turn.model_info.input_modalities = vec![InputModality::Image];
-    })
+    let unsupported_provider = probe_with(
+        |turn| {
+            use_bedrock_provider(turn);
+            turn.model_info.input_modalities = vec![InputModality::Image];
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![image_generation_tool],
+            ..Default::default()
+        },
+    )
     .await;
-    unsupported_image_generation_provider.assert_visible_lacks(&["image_generation"]);
-
-    let image_generation = probe(|turn| {
-        use_chatgpt_auth(turn);
-        set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
-        turn.model_info.input_modalities = vec![InputModality::Image];
-    })
-    .await;
-    image_generation.assert_visible_contains(&["image_generation"]);
-
-    let extension_flag_without_imagegen_tool = probe(|turn| {
-        use_chatgpt_auth(turn);
-        set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
-        set_feature(turn, Feature::ImageGenExt, /*enabled*/ true);
-        turn.model_info.input_modalities = vec![InputModality::Image];
-    })
-    .await;
-    extension_flag_without_imagegen_tool.assert_visible_contains(&["image_generation"]);
-    extension_flag_without_imagegen_tool.assert_visible_lacks(&["image_gen"]);
+    unsupported_provider.assert_visible_lacks(&["image_gen"]);
 
     let live_web_search = probe(|turn| {
         set_web_search_mode(turn, WebSearchMode::Live);
@@ -1609,7 +2066,7 @@ async fn hosted_tools_follow_provider_auth_model_and_config_gates() {
         live_web_search.visible_spec("web_search"),
         &ToolSpec::WebSearch {
             external_web_access: Some(true),
-            index_gated_web_access: None,
+            indexed_web_access: None,
             filters: None,
             user_location: None,
             search_context_size: None,
@@ -1635,7 +2092,6 @@ async fn hosted_tools_follow_provider_auth_model_and_config_gates() {
             MULTI_AGENT_V2_NAMESPACE,
             // Hosted Responses tools.
             "web_search",
-            "image_generation",
         ]
     );
 
@@ -1646,13 +2102,51 @@ async fn hosted_tools_follow_provider_auth_model_and_config_gates() {
     .await;
     standalone_web_search_without_web_run.assert_visible_contains(&["web_search"]);
 
+    let standalone_web_search_with_dynamic_web_run = probe_with(
+        |turn| {
+            set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+            set_web_search_mode(turn, WebSearchMode::Live);
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("web"),
+                "run",
+                /*defer_loading*/ false,
+            )],
+            ..Default::default()
+        },
+    )
+    .await;
+    standalone_web_search_with_dynamic_web_run.assert_visible_contains(&["web", "web_search"]);
+
+    let standalone_web_search_with_mcp_web_run = probe_with(
+        |turn| {
+            set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+            set_web_search_mode(turn, WebSearchMode::Live);
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![mcp_runtime(
+                "web_server",
+                "web",
+                "run",
+                ToolExposure::Direct,
+            )],
+            ..Default::default()
+        },
+    )
+    .await;
+    standalone_web_search_with_mcp_web_run.assert_visible_contains(&["web", "web_search"]);
+
     let standalone_web_search = probe_with(
         |turn| {
             set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
             set_web_search_mode(turn, WebSearchMode::Live);
         },
         ToolPlanInputs {
-            extension_tool_executors: vec![Arc::new(WebRunExtensionTool)],
+            extension_tool_executors: vec![Arc::new(TestNamespaceExtensionTool {
+                namespace: "web",
+                tool_name: "run",
+            })],
             ..Default::default()
         },
     )

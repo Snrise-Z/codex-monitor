@@ -6,11 +6,14 @@ use super::SandboxPolicy;
 use super::Thread;
 use super::ThreadHistoryMode;
 use super::ThreadItem;
+use super::ThreadSection;
 use super::ThreadSource;
 use super::Turn;
 use super::TurnEnvironmentParams;
 use super::TurnItemsView;
 use super::shared::v2_enum_from_core;
+use crate::JsonSchema;
+use crate::TS;
 use codex_experimental_api_macros::ExperimentalApi;
 pub use codex_protocol::capabilities::CapabilityRootLocation;
 pub use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -30,13 +33,11 @@ use codex_protocol::protocol::TokenUsageInfo as CoreTokenUsageInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -435,6 +436,20 @@ pub struct ThreadResumeResponse {
     #[experimental("thread/resume.initialTurnsPage")]
     #[serde(default)]
     pub initial_turns_page: Option<TurnsPage>,
+    /// Opaque head cursor for hydrating paginated turns backwards.
+    ///
+    /// Pass this as `cursor` to `thread/turns/list` with
+    /// `sortDirection: "desc"`. The first page includes the cursor's head turn.
+    #[experimental("thread/resume.turnsBackwardsCursor")]
+    #[serde(default)]
+    pub turns_backwards_cursor: Option<String>,
+    /// Opaque head cursor for hydrating paginated items backwards.
+    ///
+    /// Pass this as `cursor` to `thread/items/list` with
+    /// `sortDirection: "desc"`. The first page includes the cursor's head item.
+    #[experimental("thread/resume.itemsBackwardsCursor")]
+    #[serde(default)]
+    pub items_backwards_cursor: Option<String>,
 }
 
 impl ThreadResumeResponse {
@@ -501,6 +516,12 @@ pub struct ThreadForkParams {
     #[ts(optional = nullable)]
     pub last_turn_id: Option<String>,
 
+    /// Optional turn id to fork before, excluding that turn and all later turns.
+    /// Cannot be combined with `last_turn_id`.
+    #[experimental("thread/fork.beforeTurnId")]
+    #[ts(optional = nullable)]
+    pub before_turn_id: Option<String>,
+
     /// [UNSTABLE] Specify the rollout path to fork from.
     /// If specified, the thread_id param will be ignored.
     #[experimental("thread/fork.path")]
@@ -561,6 +582,12 @@ pub struct ThreadForkParams {
     #[experimental("thread/fork.excludeTurns")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclude_turns: bool,
+    /// When true, carry the source thread's current goal into the fork without
+    /// starting its initial automatic continuation. The next explicit turn owns
+    /// the goal lifecycle, and normal automatic continuation resumes after it.
+    #[experimental("thread/fork.deferGoalContinuation")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub defer_goal_continuation: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
@@ -685,7 +712,7 @@ pub struct ThreadIncrementElicitationParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadIncrementElicitationResponse {
     /// Current out-of-band elicitation count after the increment.
-    pub count: u64,
+    pub count: i64,
     /// Whether timeout accounting is paused after applying the increment.
     pub paused: bool,
 }
@@ -705,7 +732,7 @@ pub struct ThreadDecrementElicitationParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadDecrementElicitationResponse {
     /// Current out-of-band elicitation count after the decrement.
-    pub count: u64,
+    pub count: i64,
     /// Whether timeout accounting remains paused after applying the decrement.
     pub paused: bool,
 }
@@ -884,6 +911,31 @@ pub struct ThreadMetadataUpdateResponse {
     pub thread: Thread,
 }
 
+/// Parameters for moving a thread within a server-owned section ordering.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSectionMoveParams {
+    /// Thread to move into, within, or out of a section.
+    pub thread_id: String,
+    /// Destination section, or `null` to remove the thread from its section.
+    #[serde(deserialize_with = "Option::deserialize")]
+    #[schemars(
+        required,
+        schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+    )]
+    #[ts(type = "string | null")]
+    pub section_id: Option<String>,
+    /// Existing thread to insert before; omission or null appends to the section.
+    #[ts(optional = nullable)]
+    pub before_thread_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSectionMoveResponse {}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(rename_all = "lowercase")]
@@ -1008,7 +1060,7 @@ pub struct ThreadBackgroundTerminal {
     pub item_id: String,
     pub process_id: String,
     pub command: String,
-    pub cwd: AbsolutePathBuf,
+    pub cwd: LegacyAppPathString,
     pub os_pid: Option<u32>,
     pub cpu_percent: Option<f64>,
     pub rss_kb: Option<u64>,
@@ -1064,6 +1116,29 @@ pub struct ThreadRollbackResponse {
     pub thread: Thread,
 }
 
+/// Parameters for listing independently persisted thread sections.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSectionListParams {
+    /// Opaque pagination cursor returned by a previous call.
+    #[ts(optional = nullable)]
+    pub cursor: Option<String>,
+    /// Maximum number of sections to return.
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+}
+
+/// One page of independently persisted thread sections.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSectionListResponse {
+    pub data: Vec<ThreadSection>,
+    /// Opaque cursor for the next page, or `null` when no sections remain.
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1092,6 +1167,16 @@ pub struct ThreadListParams {
     /// If false or null, only non-archived threads are returned.
     #[ts(optional = nullable)]
     pub archived: Option<bool>,
+    /// Omit to include every section, set to `null` for unsectioned threads,
+    /// or provide a section ID to return only threads in that section.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::protocol::serde_helpers::serialize_double_option",
+        deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option"
+    )]
+    #[ts(optional = nullable, type = "string | null")]
+    pub section_id: Option<Option<String>>,
     /// Optional cwd filter or filters; when set, only threads whose session cwd
     /// exactly matches one of these paths are returned.
     #[ts(optional = nullable, type = "string | Array<string> | null")]
@@ -1127,7 +1212,7 @@ pub struct ThreadSearchParams {
     pub limit: Option<u32>,
     /// Optional sort key; defaults to created_at.
     #[ts(optional = nullable)]
-    pub sort_key: Option<ThreadSortKey>,
+    pub sort_key: Option<ThreadSearchSortKey>,
     /// Optional sort direction; defaults to descending (newest first).
     #[ts(optional = nullable)]
     pub sort_direction: Option<SortDirection>,
@@ -1172,6 +1257,16 @@ pub enum ThreadSourceKind {
 #[serde(rename_all = "snake_case")]
 #[ts(export_to = "v2/")]
 pub enum ThreadSortKey {
+    CreatedAt,
+    UpdatedAt,
+    RecencyAt,
+    SectionPosition,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum ThreadSearchSortKey {
     CreatedAt,
     UpdatedAt,
     RecencyAt,
@@ -1221,6 +1316,58 @@ pub struct ThreadSearchResponse {
     /// Use it with the opposite `sortDirection`; for timestamp sorts it anchors
     /// at the start of the page timestamp so same-second updates are not skipped.
     pub backwards_cursor: Option<String>,
+}
+
+/// Parameters for searching visible message occurrences within one paginated thread.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSearchOccurrencesParams {
+    pub thread_id: String,
+    /// Case-insensitive literal substring to find in visible user messages and final assistant
+    /// messages.
+    pub search_term: String,
+    /// Opaque cursor returned by a previous call for the same thread and search term.
+    #[ts(optional = nullable)]
+    pub cursor: Option<String>,
+    /// Optional occurrence page size.
+    #[ts(optional = nullable)]
+    pub limit: Option<u32>,
+}
+
+/// UTF-16 code-unit range within `snippet`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSearchTextRange {
+    /// Inclusive UTF-16 code-unit offset.
+    pub start: u32,
+    /// Exclusive UTF-16 code-unit offset.
+    pub end: u32,
+}
+
+/// One visible message occurrence returned by [`ThreadSearchOccurrencesResponse`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSearchOccurrence {
+    pub turn_id: String,
+    pub item_id: String,
+    pub snippet: String,
+    /// Match range within `snippet`, in UTF-16 code units.
+    pub snippet_match_range: ThreadSearchTextRange,
+    /// Opaque inclusive cursor accepted by `thread/turns/list` for this turn.
+    pub turn_cursor: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSearchOccurrencesResponse {
+    /// Occurrences in chronological message order.
+    pub data: Vec<ThreadSearchOccurrence>,
+    /// Opaque cursor to continue after the last returned occurrence.
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
@@ -1356,8 +1503,17 @@ pub struct ThreadItemsListParams {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+pub struct ThreadItemEntry {
+    /// Turn containing this item.
+    pub turn_id: String,
+    pub item: ThreadItem,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
 pub struct ThreadItemsListResponse {
-    pub data: Vec<ThreadItem>,
+    pub data: Vec<ThreadItemEntry>,
     /// Opaque cursor to pass to the next call to continue after the last item.
     /// if None, there are no more items to return.
     pub next_cursor: Option<String>,
@@ -1373,6 +1529,18 @@ pub struct ThreadTokenUsageUpdatedNotification {
     pub thread_id: String,
     pub turn_id: String,
     pub token_usage: ThreadTokenUsage,
+}
+
+/// Internal-only notification containing the exact usage from one upstream
+/// Responses API completion.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct RawResponseCompletedNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub response_id: String,
+    pub usage: Option<TokenUsageBreakdown>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1406,6 +1574,9 @@ pub struct TokenUsageBreakdown {
     pub input_tokens: i64,
     #[ts(type = "number")]
     pub cached_input_tokens: i64,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub cache_write_input_tokens: i64,
     #[ts(type = "number")]
     pub output_tokens: i64,
     #[ts(type = "number")]
@@ -1418,6 +1589,7 @@ impl From<CoreTokenUsage> for TokenUsageBreakdown {
             total_tokens: value.total_tokens,
             input_tokens: value.input_tokens,
             cached_input_tokens: value.cached_input_tokens,
+            cache_write_input_tokens: value.cache_write_input_tokens,
             output_tokens: value.output_tokens,
             reasoning_output_tokens: value.reasoning_output_tokens,
         }

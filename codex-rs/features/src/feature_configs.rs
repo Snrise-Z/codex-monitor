@@ -31,6 +31,46 @@ impl FeatureConfig for CodeModeConfigToml {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct CodeModeHostConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Keep code mode fail-closed when the standalone host is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disable_in_process_fallback: Option<bool>,
+}
+
+impl FeatureConfig for CodeModeHostConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = Some(enabled);
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NonPrefixedMcpToolNamesConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// MCP servers whose tools should omit the legacy `mcp__` namespace prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_names: Option<Vec<String>>,
+}
+
+impl FeatureConfig for NonPrefixedMcpToolNamesConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = Some(enabled);
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MultiAgentV2ConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -55,11 +95,23 @@ pub struct MultiAgentV2ConfigToml {
     pub root_agent_usage_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_usage_hint_text: Option<String>,
+    /// Overrides inherited developer instructions for subagents without role-specific instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_developer_instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_agent_mode_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 64), regex(pattern = r"^[a-zA-Z0-9_-]+$"))]
     pub tool_namespace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hide_spawn_agent_metadata: Option<bool>,
+    /// Exposes `model` and `reasoning_effort` on the multi-agent v2 spawn tool and adds
+    /// corresponding guidance to root and subagent usage hints.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expose_spawn_agent_model_overrides: Option<bool>,
+    /// Expose the multi-agent v2 `wait_agent` tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_agent_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_code_mode_only: Option<bool>,
 }
@@ -92,6 +144,14 @@ pub struct TokenBudgetConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 2000))]
     pub guidance_message: Option<String>,
+    /// Developer message sampled before an automatic context-window rollover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 2000))]
+    pub auto_compact_fallback_prompt: Option<String>,
+    /// Additional tokens available after the compaction threshold for fallback note-taking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub auto_compact_fallback_buffer_tokens: Option<i64>,
 }
 
 impl FeatureConfig for TokenBudgetConfigToml {

@@ -1019,7 +1019,7 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
         .submit(Op::ExecApproval {
             id: approval.effective_approval_id(),
             turn_id: None,
-            decision: ReviewDecision::Denied,
+            decision: ReviewDecision::denied("rejected by user"),
         })
         .await?;
     wait_for_completion(&test).await;
@@ -1274,7 +1274,10 @@ async fn request_permissions_grant_applies_to_monitor() -> Result<()> {
     .await?;
 
     let granted_permissions = expect_request_permissions_event(&test, "permissions-call").await;
-    assert_eq!(granted_permissions, normalized_requested_permissions.clone());
+    assert_eq!(
+        granted_permissions,
+        normalized_requested_permissions.clone()
+    );
     test.codex
         .submit(Op::RequestPermissionsResponse {
             id: "permissions-call".to_string(),
@@ -1797,7 +1800,10 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
     let approval_file_system = approval_permissions
         .file_system
         .expect("expected filesystem permissions");
-    let (approval_reads, approval_writes) = approval_file_system
+    let codex_protocol::models::LegacyReadWriteRoots {
+        read: approval_reads,
+        write: approval_writes,
+    } = approval_file_system
         .legacy_read_write_roots()
         .expect("expected legacy-compatible permissions");
     assert!(approval_reads.as_ref().is_none_or(Vec::is_empty));
@@ -1805,7 +1811,10 @@ async fn partial_request_permissions_grants_do_not_preapprove_new_permissions() 
     let mut approval_writes = approval_writes.unwrap_or_default();
     approval_writes.sort_by_key(|path| path.display().to_string());
 
-    let (_, expected_writes) = merged_permissions
+    let codex_protocol::models::LegacyReadWriteRoots {
+        write: expected_writes,
+        ..
+    } = merged_permissions
         .file_system
         .expect("expected merged filesystem permissions")
         .legacy_read_write_roots()

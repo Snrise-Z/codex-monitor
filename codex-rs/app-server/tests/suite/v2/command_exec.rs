@@ -2,7 +2,6 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
-use app_test_support::to_response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use codex_app_server_protocol::CommandExecOutputDeltaNotification;
@@ -42,8 +41,11 @@ async fn command_exec_without_streams_can_be_terminated() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let process_id = "sleep-1".to_string();
     let command_request_id = mcp
@@ -73,10 +75,7 @@ async fn command_exec_without_streams_can_be_terminated() -> Result<()> {
         .await?;
     assert_eq!(terminate_response.result, serde_json::json!({}));
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_ne!(
         response.exit_code, 0,
         "terminated command should not succeed"
@@ -92,8 +91,11 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -118,10 +120,7 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
         })
         .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(
         response,
         CommandExecResponse {
@@ -140,12 +139,12 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[("COMMAND_EXEC_BASELINE", Some("server"))],
-    )
-    .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("COMMAND_EXEC_BASELINE", Some("server"))])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -177,10 +176,7 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
         })
         .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(
         response,
         CommandExecResponse {
@@ -198,8 +194,11 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -224,10 +223,7 @@ async fn command_exec_accepts_permission_profile() -> Result<()> {
         })
         .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(
         response,
         CommandExecResponse {
@@ -249,8 +245,11 @@ async fn command_exec_permission_profile_starts_selected_network_proxy() -> Resu
         codex_home.path(),
         /*default_permissions*/ None,
     )?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -275,10 +274,7 @@ async fn command_exec_permission_profile_starts_selected_network_proxy() -> Resu
         })
         .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(
         response,
         CommandExecResponse {
@@ -297,8 +293,11 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
     insert_networked_permission_profile_config(codex_home.path(), Some("networked"))?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -323,10 +322,7 @@ async fn command_exec_permission_profile_does_not_reuse_default_network_proxy() 
         })
         .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(
         response,
         CommandExecResponse {
@@ -355,8 +351,11 @@ async fn command_exec_permission_profile_project_roots_use_command_cwd() -> Resu
 ":workspace_roots" = "write"
 "#,
     )?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -381,10 +380,7 @@ async fn command_exec_permission_profile_project_roots_use_command_cwd() -> Resu
         })
         .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(
         response.exit_code, 0,
         "parent cwd write should fail under command project-root profile: {response:?}"
@@ -406,12 +402,12 @@ async fn command_exec_returns_error_when_local_environment_is_disabled() -> Resu
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[(CODEX_EXEC_SERVER_URL_ENV_VAR, Some("none"))],
-    )
-    .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[(CODEX_EXEC_SERVER_URL_ENV_VAR, Some("none"))])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -445,8 +441,11 @@ async fn command_exec_rejects_sandbox_policy_with_permission_profile() -> Result
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -483,8 +482,11 @@ async fn command_exec_rejects_disable_timeout_with_timeout_ms() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -521,8 +523,11 @@ async fn command_exec_rejects_disable_output_cap_with_output_bytes_cap() -> Resu
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -559,8 +564,11 @@ async fn command_exec_rejects_negative_timeout_ms() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -597,8 +605,11 @@ async fn command_exec_without_process_id_rejects_streaming() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -635,8 +646,11 @@ async fn command_exec_non_streaming_respects_output_cap() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let command_request_id = mcp
         .send_command_exec_request(CommandExecParams {
@@ -661,10 +675,7 @@ async fn command_exec_non_streaming_respects_output_cap() -> Result<()> {
         })
         .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(
         response,
         CommandExecResponse {
@@ -682,8 +693,11 @@ async fn command_exec_streaming_does_not_buffer_output() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let process_id = "stream-cap-1".to_string();
     let command_request_id = mcp
@@ -727,10 +741,7 @@ async fn command_exec_streaming_does_not_buffer_output() -> Result<()> {
         .await?;
     assert_eq!(terminate_response.result, serde_json::json!({}));
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_ne!(
         response.exit_code, 0,
         "terminated command should not succeed"
@@ -746,8 +757,11 @@ async fn command_exec_pipe_streams_output_and_accepts_write() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let process_id = "pipe-1".to_string();
     let command_request_id = mcp
@@ -801,10 +815,7 @@ async fn command_exec_pipe_streams_output_and_accepts_write() -> Result<()> {
     )
     .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(
         response,
         CommandExecResponse {
@@ -822,8 +833,11 @@ async fn command_exec_tty_implies_streaming_and_reports_pty_output() -> Result<(
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let process_id = "tty-1".to_string();
     let command_request_id = mcp
@@ -877,10 +891,7 @@ async fn command_exec_tty_implies_streaming_and_reports_pty_output() -> Result<(
     )
     .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(response.exit_code, 0);
     assert_eq!(response.stdout, "");
     assert_eq!(response.stderr, "");
@@ -893,8 +904,11 @@ async fn command_exec_tty_supports_initial_size_and_resize() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let process_id = "tty-size-1".to_string();
     let command_request_id = mcp
@@ -965,10 +979,7 @@ async fn command_exec_tty_supports_initial_size_and_resize() -> Result<()> {
     )
     .await?;
 
-    let response = mcp
-        .read_stream_until_response_message(RequestId::Integer(command_request_id))
-        .await?;
-    let response: CommandExecResponse = to_response(response)?;
+    let response: CommandExecResponse = mcp.read_response(command_request_id).await?;
     assert_eq!(response.exit_code, 0);
     assert_eq!(response.stdout, "");
     assert_eq!(response.stderr, "");
@@ -1064,10 +1075,7 @@ async fn command_exec_process_ids_are_connection_scoped_and_disconnect_terminate
 async fn read_command_exec_delta(
     mcp: &mut TestAppServer,
 ) -> Result<CommandExecOutputDeltaNotification> {
-    let notification = mcp
-        .read_stream_until_notification_message("command/exec/outputDelta")
-        .await?;
-    decode_delta_notification(notification)
+    mcp.read_notification("command/exec/outputDelta").await
 }
 
 async fn wait_for_command_exec_output_contains(

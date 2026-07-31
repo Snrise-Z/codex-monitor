@@ -4,12 +4,11 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
+use app_test_support::MockResponsesConfig;
 use app_test_support::TestAppServer;
-use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::ItemCompletedNotification;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -17,7 +16,9 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_features::Feature;
 use core_test_support::responses;
+use core_test_support::skip_if_remote;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -87,10 +88,19 @@ async fn standalone_image_generation_returns_saved_path_hint_to_model() -> Resul
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp =
-        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-    start_image_generation_turn(&mut mcp).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let turn_id = start_image_generation_turn(
+        &mut mcp,
+        ThreadStartParams {
+            service_name: Some("chatgpt_cca".to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     let completed = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -103,13 +113,13 @@ async fn standalone_image_generation_returns_saved_path_hint_to_model() -> Resul
     )
     .await??;
 
-    let ThreadItem::ImageGeneration {
+    let ThreadItem::ImageGeneration(ImageGenerationItem {
         status,
         revised_prompt,
         result,
         saved_path: Some(saved_path),
         ..
-    } = completed.item
+    }) = completed.item
     else {
         panic!("expected completed image generation item with saved path");
     };
@@ -117,6 +127,24 @@ async fn standalone_image_generation_returns_saved_path_hint_to_model() -> Resul
     assert_eq!(revised_prompt.as_deref(), Some("paint a blue whale"));
     assert_eq!(result, RESULT);
     assert_eq!(std::fs::read(&saved_path)?, TINY_PNG_BYTES);
+
+    let image_request = server
+        .received_requests()
+        .await
+        .context("failed to fetch received requests")?
+        .into_iter()
+        .find(|request| request.url.path() == "/api/codex/images/generations")
+        .context("image generation request should be sent")?;
+    assert_eq!(
+        image_request
+            .headers
+            .get("originator")
+            .context("standalone image generation should include the thread originator")?
+            .to_str()
+            .context("standalone image generation originator should be valid ASCII")?,
+        "chatgpt_cca"
+    );
+    assert_image_turn_id_header(&image_request, &turn_id)?;
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
@@ -135,6 +163,10 @@ async fn standalone_image_generation_returns_saved_path_hint_to_model() -> Resul
     assert!(
         output_hint.contains(&saved_path.display().to_string()),
         "output hint should identify the path the extension saved"
+    );
+    assert!(
+        output_hint.contains("already displayed to the user"),
+        "output hint should tell the model not to repeat the generated image: {output_hint}"
     );
     assert!(
         !requests[1]
@@ -185,10 +217,12 @@ async fn standalone_image_generation_failure_emits_terminal_item() -> Result<()>
         ChatGptAuthFixture::new("access-chatgpt"),
         AuthCredentialsStoreMode::File,
     )?;
-    let mut mcp =
-        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-    start_image_generation_turn(&mut mcp).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    start_image_generation_turn(&mut mcp, ThreadStartParams::default()).await?;
 
     let completed = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -197,13 +231,13 @@ async fn standalone_image_generation_failure_emits_terminal_item() -> Result<()>
     .await??;
     assert_eq!(
         completed.item,
-        ThreadItem::ImageGeneration {
+        ThreadItem::ImageGeneration(ImageGenerationItem {
             id: call_id.to_string(),
             status: "failed".to_string(),
             revised_prompt: Some("paint a blue whale".to_string()),
             result: String::new(),
             saved_path: None,
-        }
+        })
     );
 
     timeout(
@@ -227,6 +261,11 @@ async fn standalone_image_generation_failure_emits_terminal_item() -> Result<()>
 
 #[tokio::test]
 async fn standalone_image_edit_uses_attached_model_visible_image() -> Result<()> {
+    skip_if_remote!(
+        Ok(()),
+        "remote executors use different imagegen storage approaches, so host-local image paths are unavailable"
+    );
+
     let edit_request = run_image_edit_test(|codex_home| {
         let image_path = codex_home.join("attached.png");
         std::fs::write(&image_path, TINY_PNG_BYTES)?;
@@ -306,10 +345,12 @@ async fn standalone_image_generation_is_exposed_in_code_mode_only() -> Result<()
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp =
-        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-    start_image_generation_turn(&mut mcp).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    start_image_generation_turn(&mut mcp, ThreadStartParams::default()).await?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -369,10 +410,12 @@ generatedImage(result);
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp =
-        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-    start_image_generation_turn(&mut mcp).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    start_image_generation_turn(&mut mcp, ThreadStartParams::default()).await?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
@@ -401,9 +444,13 @@ generatedImage(result);
     Ok(())
 }
 
-async fn start_image_generation_turn(mcp: &mut TestAppServer) -> Result<()> {
+async fn start_image_generation_turn(
+    mcp: &mut TestAppServer,
+    thread_start_params: ThreadStartParams,
+) -> Result<String> {
     start_turn(
         mcp,
+        thread_start_params,
         vec![V2UserInput::Text {
             text: "Generate an image".to_string(),
             text_elements: Vec::new(),
@@ -449,10 +496,20 @@ async fn run_image_edit_test(
         AuthCredentialsStoreMode::File,
     )?;
 
-    let mut mcp =
-        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-    start_turn(&mut mcp, input).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let turn_id = start_turn(
+        &mut mcp,
+        ThreadStartParams {
+            service_name: Some("chatgpt_cca".to_string()),
+            ..Default::default()
+        },
+        input,
+    )
+    .await?;
     timeout(
         DEFAULT_READ_TIMEOUT,
         wait_for_image_generation_completed(&mut mcp),
@@ -469,23 +526,45 @@ async fn run_image_edit_test(
         .received_requests()
         .await
         .context("failed to fetch received requests")?;
-    Ok(requests
+    let image_request = requests
         .iter()
         .find(|request| request.url.path() == "/api/codex/images/edits")
-        .context("image edit request should be sent")?
-        .body_json::<serde_json::Value>()?)
+        .context("image edit request should be sent")?;
+    assert_eq!(
+        image_request
+            .headers
+            .get("originator")
+            .context("standalone image edit should include the thread originator")?
+            .to_str()
+            .context("standalone image edit originator should be valid ASCII")?,
+        "chatgpt_cca"
+    );
+    assert_image_turn_id_header(image_request, &turn_id)?;
+    Ok(image_request.body_json::<serde_json::Value>()?)
 }
 
-async fn start_turn(mcp: &mut TestAppServer, input: Vec<V2UserInput>) -> Result<()> {
+fn assert_image_turn_id_header(request: &wiremock::Request, expected_turn_id: &str) -> Result<()> {
+    let turn_id = request
+        .headers
+        .get("x-codex-image-turn-id")
+        .context("image request should include the current turn id")?
+        .to_str()
+        .context("image turn id should be valid ASCII")?;
+    uuid::Uuid::parse_str(turn_id).context("image turn id should be a UUID")?;
+    assert_eq!(turn_id, expected_turn_id);
+    Ok(())
+}
+
+async fn start_turn(
+    mcp: &mut TestAppServer,
+    thread_start_params: ThreadStartParams,
+    input: Vec<V2UserInput>,
+) -> Result<String> {
     let thread_req = mcp
-        .send_thread_start_request(ThreadStartParams::default())
+        .send_thread_start_request_with_auto_env(thread_start_params)
         .await?;
-    let thread_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(thread_req)).await??;
 
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
@@ -495,29 +574,18 @@ async fn start_turn(mcp: &mut TestAppServer, input: Vec<V2UserInput>) -> Result<
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_req)),
-    )
-    .await??;
-    let _turn: TurnStartResponse = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_req)).await??;
 
-    Ok(())
+    Ok(turn.id)
 }
 
 async fn wait_for_image_generation_completed(
     mcp: &mut TestAppServer,
 ) -> Result<ItemCompletedNotification> {
     loop {
-        let notification = mcp
-            .read_stream_until_notification_message("item/completed")
-            .await?;
-        let completed: ItemCompletedNotification = serde_json::from_value(
-            notification
-                .params
-                .context("item/completed notification should include params")?,
-        )?;
-        if matches!(&completed.item, ThreadItem::ImageGeneration { .. }) {
+        let completed: ItemCompletedNotification = mcp.read_notification("item/completed").await?;
+        if matches!(&completed.item, ThreadItem::ImageGeneration(_)) {
             return Ok(completed);
         }
     }
@@ -552,33 +620,14 @@ fn create_config_toml(
     server_uri: &str,
     mode: ImagegenTestMode,
 ) -> std::io::Result<()> {
-    let code_mode_only = match mode {
-        ImagegenTestMode::Direct => "",
-        ImagegenTestMode::CodeModeOnly => "code_mode_only = true",
-    };
-    std::fs::write(
-        codex_home.join("config.toml"),
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-model_provider = "openai-custom"
-chatgpt_base_url = "{server_uri}"
-
-[features]
-imagegenext = true
-{code_mode_only}
-
-[model_providers.openai-custom]
-name = "OpenAI"
-base_url = "{server_uri}/api/codex"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-supports_websockets = false
-requires_openai_auth = true
-"#
-        ),
-    )
+    let mut config = MockResponsesConfig::new(server_uri)
+        .with_model_provider("openai-custom")
+        .with_provider_name("OpenAI")
+        .with_provider_base_url(&format!("{server_uri}/api/codex"))
+        .with_root_config(&format!("chatgpt_base_url = \"{server_uri}\""))
+        .with_provider_config("supports_websockets = false\nrequires_openai_auth = true");
+    if matches!(mode, ImagegenTestMode::CodeModeOnly) {
+        config = config.enable_feature(Feature::CodeModeOnly);
+    }
+    config.write(codex_home)
 }

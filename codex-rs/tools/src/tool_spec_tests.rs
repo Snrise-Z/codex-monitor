@@ -9,6 +9,7 @@ use crate::JsonSchema;
 use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
 use crate::create_tools_json_for_responses_api;
+use crate::create_tools_raw_json_for_responses_api;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchFilters as ConfigWebSearchFilters;
 use codex_protocol::config_types::WebSearchUserLocation as ConfigWebSearchUserLocation;
@@ -58,16 +59,9 @@ fn tool_spec_name_covers_all_variants() {
         "tool_search"
     );
     assert_eq!(
-        ToolSpec::ImageGeneration {
-            output_format: "png".to_string(),
-        }
-        .name(),
-        "image_generation"
-    );
-    assert_eq!(
         ToolSpec::WebSearch {
             external_web_access: Some(true),
-            index_gated_web_access: None,
+            indexed_web_access: None,
             filters: None,
             user_location: None,
             search_context_size: None,
@@ -151,6 +145,29 @@ fn create_tools_json_for_responses_api_includes_top_level_name() {
 }
 
 #[test]
+fn raw_tool_json_matches_value_encoding() {
+    let specs = vec![ToolSpec::Function(ResponsesApiTool {
+        name: "demo".to_string(),
+        description: "A demo tool".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            BTreeMap::new(),
+            /*required*/ None,
+            /*additional_properties*/ None,
+        ),
+        output_schema: None,
+    })];
+    let expected = create_tools_json_for_responses_api(&specs).expect("serialize tools");
+    let raw = create_tools_raw_json_for_responses_api(&specs).expect("serialize raw tools");
+
+    assert_eq!(
+        serde_json::from_str::<Vec<serde_json::Value>>(raw.get()).expect("parse raw tools"),
+        expected,
+    );
+}
+
+#[test]
 fn namespace_tool_spec_serializes_expected_wire_shape() {
     assert_eq!(
         serde_json::to_value(ToolSpec::Namespace(ResponsesApiNamespace {
@@ -200,7 +217,7 @@ fn web_search_tool_spec_serializes_expected_wire_shape() {
     assert_eq!(
         serde_json::to_value(ToolSpec::WebSearch {
             external_web_access: Some(true),
-            index_gated_web_access: None,
+            indexed_web_access: Some(true),
             filters: Some(ResponsesApiWebSearchFilters {
                 allowed_domains: Some(vec!["example.com".to_string()]),
             }),
@@ -218,6 +235,7 @@ fn web_search_tool_spec_serializes_expected_wire_shape() {
         json!({
             "type": "web_search",
             "external_web_access": true,
+            "indexed_web_access": true,
             "filters": {
                 "allowed_domains": ["example.com"],
             },

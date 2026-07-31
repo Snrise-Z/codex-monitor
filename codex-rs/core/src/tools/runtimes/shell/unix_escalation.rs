@@ -4,8 +4,6 @@ use crate::exec::ExecExpiration;
 use crate::exec::cancel_when_either;
 use crate::exec::is_likely_sandbox_denied;
 use crate::guardian::GuardianApprovalRequest;
-use crate::guardian::guardian_rejection_message;
-use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
 use crate::guardian::routes_approval_to_guardian;
@@ -38,8 +36,6 @@ use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
-use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GuardianCommandSource;
 use codex_protocol::protocol::NetworkPolicyRuleAction;
@@ -49,6 +45,7 @@ use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::record_filesystem_sandbox_violation;
 use codex_shell_command::bash::parse_shell_lc_plain_commands;
 use codex_shell_command::bash::parse_shell_lc_single_command_prefix;
 use codex_shell_escalation::EscalateServer;
@@ -162,13 +159,12 @@ pub(super) async fn try_run_zsh_fork(
         windows_sandbox_level,
         windows_sandbox_private_desktop: _windows_sandbox_private_desktop,
         permission_profile,
-        file_system_sandbox_policy,
-        network_sandbox_policy,
         windows_sandbox_filesystem_overrides: _windows_sandbox_filesystem_overrides,
         arg0,
         exec_server_sandbox: _,
         exec_server_enforce_managed_network: _,
         exec_server_managed_network: _,
+        exec_server_network_proxy: _,
     } = sandbox_exec_request;
     let ParsedShellCommand { script, login, .. } = extract_shell_script(&command)?;
     let effective_timeout = Duration::from_millis(
@@ -190,8 +186,6 @@ pub(super) async fn try_run_zsh_fork(
         command,
         cwd: sandbox_cwd,
         permission_profile,
-        file_system_sandbox_policy,
-        network_sandbox_policy,
         sandbox,
         env: sandbox_env,
         network: sandbox_network,
@@ -241,7 +235,6 @@ pub(super) async fn try_run_zsh_fork(
         tool_name: GuardianCommandSource::Shell,
         approval_policy: ctx.turn.approval_policy.value(),
         permission_profile: command_executor.permission_profile.clone(),
-        file_system_sandbox_policy: command_executor.file_system_sandbox_policy.clone(),
         sandbox_permissions: req.sandbox_permissions,
         approval_sandbox_permissions,
         prompt_permissions: req.additional_permissions.clone(),
@@ -303,8 +296,6 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         command: exec_request.command.clone(),
         cwd,
         permission_profile: exec_request.permission_profile.clone(),
-        file_system_sandbox_policy: exec_request.file_system_sandbox_policy.clone(),
-        network_sandbox_policy: exec_request.network_sandbox_policy,
         sandbox: exec_request.sandbox,
         env: exec_request.env.clone(),
         network: exec_request.network.clone(),
@@ -325,7 +316,6 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         tool_name: GuardianCommandSource::UnifiedExec,
         approval_policy: ctx.turn.approval_policy.value(),
         permission_profile: exec_request.permission_profile.clone(),
-        file_system_sandbox_policy: exec_request.file_system_sandbox_policy.clone(),
         sandbox_permissions: req.sandbox_permissions,
         approval_sandbox_permissions: approval_sandbox_permissions(
             req.sandbox_permissions,
@@ -360,7 +350,6 @@ struct CoreShellActionProvider {
     tool_name: GuardianCommandSource,
     approval_policy: AskForApproval,
     permission_profile: PermissionProfile,
-    file_system_sandbox_policy: FileSystemSandboxPolicy,
     sandbox_permissions: SandboxPermissions,
     approval_sandbox_permissions: SandboxPermissions,
     prompt_permissions: Option<AdditionalPermissionProfile>,
@@ -372,12 +361,6 @@ enum DecisionSource {
     PrefixRule,
     /// Often, this is `is_safe_command()`.
     UnmatchedCommandFallback,
-}
-
-struct PromptDecision {
-    decision: ReviewDecision,
-    guardian_review_id: Option<String>,
-    rejection_message: Option<String>,
 }
 
 fn execve_prompt_is_rejected_by_policy(
@@ -411,13 +394,12 @@ impl CoreShellActionProvider {
     fn shell_request_escalation_execution(
         sandbox_permissions: SandboxPermissions,
         permission_profile: &PermissionProfile,
-        file_system_sandbox_policy: &FileSystemSandboxPolicy,
         additional_permissions: Option<&AdditionalPermissionProfile>,
     ) -> EscalationExecution {
         match sandbox_permissions {
             SandboxPermissions::UseDefault => EscalationExecution::TurnDefault,
             SandboxPermissions::RequireEscalated => {
-                if unsandboxed_execution_allowed(file_system_sandbox_policy) {
+                if unsandboxed_execution_allowed(&permission_profile.file_system_sandbox_policy()) {
                     EscalationExecution::Unsandboxed
                 } else {
                     EscalationExecution::TurnDefault
@@ -446,7 +428,7 @@ impl CoreShellActionProvider {
         workdir: &AbsolutePathBuf,
         stopwatch: &Stopwatch,
         additional_permissions: Option<AdditionalPermissionProfile>,
-    ) -> anyhow::Result<PromptDecision> {
+    ) -> anyhow::Result<ReviewDecision> {
         let command = join_program_and_argv(program, argv);
         let workdir = workdir.clone();
         let session = self.session.clone();
@@ -473,28 +455,20 @@ impl CoreShellActionProvider {
                 .await
                 {
                     Some(PermissionRequestDecision::Allow) => {
-                        return PromptDecision {
-                            decision: ReviewDecision::Approved,
-                            guardian_review_id: None,
-                            rejection_message: None,
-                        };
+                        return ReviewDecision::Approved;
                     }
                     Some(PermissionRequestDecision::Deny { message }) => {
-                        return PromptDecision {
-                            decision: ReviewDecision::Denied,
-                            guardian_review_id: None,
-                            rejection_message: Some(message),
-                        };
+                        return ReviewDecision::denied(message);
                     }
                     None => {}
                 }
 
                 // 2) Route to Guardian if configured
-                if let Some(review_id) = guardian_review_id.clone() {
-                    let decision = review_approval_request(
+                if let Some(review_id) = guardian_review_id {
+                    return review_approval_request(
                         &session,
                         &turn,
-                        review_id.clone(),
+                        review_id,
                         GuardianApprovalRequest::Execve {
                             id: call_id.clone(),
                             source,
@@ -506,15 +480,10 @@ impl CoreShellActionProvider {
                         /*retry_reason*/ None,
                     )
                     .await;
-                    return PromptDecision {
-                        decision,
-                        guardian_review_id,
-                        rejection_message: None,
-                    };
                 }
 
                 // 3) Fall back to regular user prompt
-                let decision = session
+                session
                     .request_command_approval(
                         &turn,
                         call_id,
@@ -527,13 +496,9 @@ impl CoreShellActionProvider {
                         /*proposed_execpolicy_amendment*/ None,
                         additional_permissions,
                         Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
+                        /*plugin_attribution_override*/ None,
                     )
-                    .await;
-                PromptDecision {
-                    decision,
-                    guardian_review_id: None,
-                    rejection_message: None,
-                }
+                    .await
             })
             .await)
     }
@@ -560,10 +525,10 @@ impl CoreShellActionProvider {
                 {
                     EscalationDecision::deny(Some("Execution forbidden by policy".to_string()))
                 } else {
-                    let prompt_decision = self
+                    let decision = self
                         .prompt(program, argv, workdir, &self.stopwatch, prompt_permissions)
                         .await?;
-                    match prompt_decision.decision {
+                    match decision {
                         ReviewDecision::Approved
                         | ReviewDecision::ApprovedForSession
                         | ReviewDecision::ApprovedExecpolicyAmendment { .. } => {
@@ -587,23 +552,12 @@ impl CoreShellActionProvider {
                                 EscalationDecision::deny(Some("User denied execution".to_string()))
                             }
                         },
-                        ReviewDecision::Denied => {
-                            let message = if let Some(message) =
-                                prompt_decision.rejection_message.clone()
-                            {
-                                message
-                            } else if let Some(review_id) =
-                                prompt_decision.guardian_review_id.as_deref()
-                            {
-                                guardian_rejection_message(self.session.as_ref(), review_id).await
-                            } else {
-                                "User denied execution".to_string()
-                            };
-                            EscalationDecision::deny(Some(message))
+                        ReviewDecision::Denied { rejection } => {
+                            EscalationDecision::deny(Some(rejection))
                         }
-                        ReviewDecision::TimedOut => {
-                            EscalationDecision::deny(Some(guardian_timeout_message()))
-                        }
+                        ReviewDecision::TimedOut => EscalationDecision::deny(Some(
+                            crate::guardian::guardian_timeout_message(),
+                        )),
                         ReviewDecision::Abort => {
                             EscalationDecision::deny(Some("User cancelled execution".to_string()))
                         }
@@ -662,7 +616,8 @@ impl CoreShellActionProvider {
         // fallback function.
         let decision_driven_by_policy =
             Self::decision_driven_by_policy(&evaluation.matched_rules, evaluation.decision);
-        let unsandboxed_allowed = unsandboxed_execution_allowed(&self.file_system_sandbox_policy);
+        let unsandboxed_allowed =
+            unsandboxed_execution_allowed(&self.permission_profile.file_system_sandbox_policy());
         let needs_escalation = match self.sandbox_permissions {
             SandboxPermissions::UseDefault => unsandboxed_allowed && decision_driven_by_policy,
             SandboxPermissions::RequireEscalated => unsandboxed_allowed,
@@ -680,7 +635,6 @@ impl CoreShellActionProvider {
             DecisionSource::UnmatchedCommandFallback => Self::shell_request_escalation_execution(
                 self.sandbox_permissions,
                 &self.permission_profile,
-                &self.file_system_sandbox_policy,
                 self.prompt_permissions.as_ref(),
             ),
         };
@@ -812,8 +766,6 @@ struct CoreShellCommandExecutor {
     command: Vec<String>,
     cwd: AbsolutePathBuf,
     permission_profile: PermissionProfile,
-    file_system_sandbox_policy: FileSystemSandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
     sandbox: SandboxType,
     env: HashMap<String, String>,
     network: Option<codex_network_proxy::NetworkProxy>,
@@ -897,13 +849,12 @@ impl CoreShellCommandExecutor {
                 windows_sandbox_level: self.windows_sandbox_level,
                 windows_sandbox_private_desktop: false,
                 permission_profile: self.permission_profile.clone(),
-                file_system_sandbox_policy: self.file_system_sandbox_policy.clone(),
-                network_sandbox_policy: self.network_sandbox_policy,
                 windows_sandbox_filesystem_overrides: None,
                 arg0: self.arg0.clone(),
                 exec_server_sandbox: None,
                 exec_server_enforce_managed_network: false,
                 exec_server_managed_network: None,
+                exec_server_network_proxy: None,
             },
             /*stdout_stream*/ None,
             after_spawn,
@@ -992,15 +943,12 @@ impl CoreShellCommandExecutor {
             permission_profile,
             additional_permissions,
         } = params;
-        let (file_system_sandbox_policy, network_sandbox_policy) =
-            permission_profile.to_runtime_permissions();
         let (program, args) = command
             .split_first()
             .ok_or_else(|| anyhow::anyhow!("prepared command must not be empty"))?;
         let sandbox_manager = SandboxManager::new();
         let sandbox = sandbox_manager.select_initial(
-            &file_system_sandbox_policy,
-            network_sandbox_policy,
+            permission_profile,
             SandboxablePreference::Auto,
             self.windows_sandbox_level,
             self.network.is_some(),
@@ -1114,6 +1062,7 @@ fn map_exec_result(
     }
 
     if is_likely_sandbox_denied(sandbox, &output) {
+        record_filesystem_sandbox_violation(sandbox, &output);
         return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
             output: Box::new(output),
             network_policy_decision: None,
